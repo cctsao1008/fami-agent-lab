@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import queue
 import subprocess
 import sys
 import threading
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("build/checkpoints/smb1-planner-v2.mss"),
     )
     parser.add_argument("--max-decisions", type=int, default=160)
-    parser.add_argument("--step-timeout", type=float, default=2.0)
+    parser.add_argument("--step-timeout", type=float, default=5.0)
     parser.add_argument("--timeout", type=float, default=1200.0)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -325,6 +326,14 @@ def worker(args: argparse.Namespace) -> None:
     )
 
 
+def _read_worker_output(stream, output_queue: queue.Queue[str | None]) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            output_queue.put(line)
+    finally:
+        output_queue.put(None)
+
+
 def supervisor(args: argparse.Namespace) -> int:
     command = [
         sys.executable,
@@ -350,21 +359,41 @@ def supervisor(args: argparse.Namespace) -> int:
     failed = False
     deadline = time.monotonic() + args.timeout
     assert process.stdout is not None
+
+    output_queue: queue.Queue[str | None] = queue.Queue()
+    reader = threading.Thread(
+        target=_read_worker_output,
+        args=(process.stdout, output_queue),
+        daemon=True,
+    )
+    reader.start()
+
     try:
+        stream_closed = False
         while time.monotonic() < deadline:
-            line = process.stdout.readline()
-            if line:
-                print(line, end="")
-                if READY_MARKER in line:
-                    ready = True
-                    break
-                if FAIL_MARKER in line:
-                    failed = True
+            try:
+                line = output_queue.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None and not reader.is_alive():
                     break
                 continue
-            if process.poll() is not None:
+
+            if line is None:
+                stream_closed = True
+                if process.poll() is not None:
+                    break
+                continue
+
+            print(line, end="")
+            if READY_MARKER in line:
+                ready = True
                 break
-            time.sleep(0.01)
+            if FAIL_MARKER in line:
+                failed = True
+                break
+
+            if stream_closed and process.poll() is not None:
+                break
     finally:
         if process.poll() is None:
             process.terminate()
