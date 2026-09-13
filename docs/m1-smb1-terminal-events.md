@@ -107,4 +107,41 @@ later third-life/game-over path eventually returned to X=40
 
 The important result is not merely that the baseline failed to finish. It exposed two repeatable hazard regions around the observed death coordinates and, more importantly, discovered the direct `0x06` death path.
 
-The next traversal revision therefore uses machine-derived pre-emptive long-jump windows before those hazards instead of waiting for a stall after Mario is already in danger. The windows are experiment policy, not game truth; their evidence source is this trace.
+### Attempt 3 — hazard-window long jumps
+
+The next revision added pre-emptive long-jump windows derived from the previous machine trace. That did not improve the early traversal reliably. A stall-triggered long jump at `X=722` produced an enemy/collision death shortly afterwards:
+
+```text
+LongJump  : frame=792 X=722 hold=34 reason=stall recoveries=1
+EngineEdge: frame=889 0x08->0x0B X=813 Y=0xAC State=1
+LevelRun  : FAIL death before completion frame=889 engine=0x0B x=813 max_x=813
+Supervisor: FAIL
+```
+
+This is evidence that adding more hand-authored jump heuristics is becoming counterproductive: action timing can trade one failure mode for another, and failure coordinates alone are not a sufficient planning state.
+
+## Planning pivot
+
+The next step is therefore not another heuristic tweak. M1 now pivots to checkpointed action search:
+
+```text
+known-good machine state
+→ save Mesen state file
+→ try bounded candidate action sequence
+→ measure authoritative SMB1 result
+→ restore checkpoint
+→ try next candidate
+→ commit only the best safe transition
+```
+
+Mesen already exposes `SaveStateFile` / `LoadStateFile`; their ABI was verified directly in the pinned `InteropDLL/EmuApiWrapper.cpp`. Fami Pixel now binds those functions in the Python Mesen adapter and adds a dedicated state-file roundtrip smoke probe before any planner depends on them.
+
+This preserves the architecture boundary:
+
+```text
+Mesen save state = machine checkpoint authority
+planner          = experiment/search policy
+SMB1 decoder     = result interpretation
+```
+
+The checkpoint mechanism must be machine-validated before it is used to close `LEVEL_COMPLETED`.
