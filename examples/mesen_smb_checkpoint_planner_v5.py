@@ -8,12 +8,18 @@ alive across a bounded multi-decision audit.
 
 Only the first 30-frame root candidate selected by the audit is committed to the
 real episode. Every deeper branch remains counterfactual planning evidence.
+
+When capture is enabled, authoritative decision checkpoints and immediate root
+candidate endpoints are saved inside the worker process. This makes each binary
+snapshot atomic with respect to the planner state and avoids the stdout/copy race
+that existed in the external sportscast wrapper.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import queue
 import shutil
 import subprocess
@@ -68,6 +74,10 @@ AUDIT_REASON_LABELS = {
     "fast-loop": "normal fast control",
 }
 
+CAPTURE_INDEX_HEADER = (
+    "kind\tdecision\taction\tframe\tmario_x\tsize_bytes\tsha256\tcheckpoint\n"
+)
+
 
 @dataclass(frozen=True)
 class BeamNode:
@@ -110,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         "--state-file",
         type=Path,
         default=Path("build/checkpoints/smb1-planner-v5.mss"),
+    )
+    parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        default=Path("build/checkpoints/v5-cast-captures"),
+        help="Worker-owned directory for authoritative and immediate root-candidate .mss captures.",
     )
     parser.add_argument("--max-decisions", type=int, default=160)
     parser.add_argument("--step-timeout", type=float, default=5.0)
@@ -166,6 +182,94 @@ def path_summary(trace: tuple[str, ...]) -> str:
     return " -> ".join(action_label(name) for name in trace)
 
 
+def initialize_capture_dir(path: Path) -> Path:
+    capture_dir = path.expanduser().resolve()
+    if capture_dir.exists():
+        shutil.rmtree(capture_dir)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    (capture_dir / "index.tsv").write_text(CAPTURE_INDEX_HEADER, encoding="utf-8")
+    return capture_dir
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def record_capture(
+    capture_dir: Path,
+    path: Path,
+    *,
+    kind: str,
+    decision: int,
+    action: str,
+    frame: int,
+    mario_x: int,
+) -> None:
+    size = path.stat().st_size
+    digest = sha256_file(path)
+    with (capture_dir / "index.tsv").open("a", encoding="utf-8", newline="") as handle:
+        handle.write(
+            f"{kind}\t{decision}\t{action}\t{frame}\t{mario_x}\t"
+            f"{size}\t{digest}\t{path.name}\n"
+        )
+
+
+def capture_authoritative_root(
+    state_file: Path,
+    capture_dir: Path,
+    decision: int,
+    frame: int,
+    mario_x: int,
+) -> Path:
+    destination = capture_dir / (
+        f"decision-{decision:03d}-authoritative-frame-{frame:06d}-X-{mario_x:04d}.mss"
+    )
+    shutil.copy2(state_file, destination)
+    record_capture(
+        capture_dir,
+        destination,
+        kind="authoritative",
+        decision=decision,
+        action="-",
+        frame=frame,
+        mario_x=mario_x,
+    )
+    print(
+        f"Binary capture : authoritative decision {decision:03d} -> {destination.name} "
+        f"({destination.stat().st_size} bytes, sha256={sha256_file(destination)[:12]}...) ",
+        flush=True,
+    )
+    return destination
+
+
+def capture_candidate_endpoint(
+    core: MesenCore,
+    capture_dir: Path,
+    decision: int,
+    candidate_name: str,
+) -> None:
+    state = read_smb1_state(core)
+    observation = observation_from_state(core.frame_count(), state)
+    path = capture_dir / (
+        f"decision-{decision:03d}-root-{candidate_name}-"
+        f"frame-{observation.native_frame_id:06d}-X-{observation.mario_x_abs:04d}.mss"
+    )
+    frame, mario_x, _engine = save_checkpoint(core, path)
+    record_capture(
+        capture_dir,
+        path,
+        kind="root-candidate",
+        decision=decision,
+        action=candidate_name,
+        frame=frame,
+        mario_x=mario_x,
+    )
+
+
 def evaluate_local_candidates(
     core: MesenCore,
     checkpoint_path: Path,
@@ -174,6 +278,8 @@ def evaluate_local_candidates(
     checkpoint_engine: int,
     checkpoint_observation,
     timeout_s: float,
+    capture_dir: Path | None = None,
+    decision: int | None = None,
 ) -> tuple[CandidateOutcome, ...]:
     outcomes: list[CandidateOutcome] = []
     for candidate in CANDIDATES:
@@ -184,7 +290,10 @@ def evaluate_local_candidates(
             checkpoint_x,
             checkpoint_engine,
         )
-        outcomes.append(run_candidate(core, candidate, checkpoint_observation, timeout_s))
+        outcome = run_candidate(core, candidate, checkpoint_observation, timeout_s)
+        outcomes.append(outcome)
+        if capture_dir is not None and decision is not None:
+            capture_candidate_endpoint(core, capture_dir, decision, candidate.name)
     return tuple(outcomes)
 
 
@@ -200,7 +309,6 @@ def node_score(node: BeamNode) -> float:
 
 def select_diverse_beam(nodes: list[BeamNode], beam_width: int) -> list[BeamNode]:
     """Keep the strongest unique machine-state signatures."""
-
     ordered = sorted(
         nodes,
         key=lambda node: (
@@ -238,9 +346,7 @@ def format_beam_depth(depth: int, frontier: list[BeamNode]) -> list[str]:
         lines.append(
             f"    [{index}] first action: {action_label(node.root_candidate_name)}"
         )
-        lines.append(
-            f"        projected state: {motion_summary(node.observation)}"
-        )
+        lines.append(f"        projected state: {motion_summary(node.observation)}")
         lines.append(
             f"        progress: {node.progress:+d} | best X reached: {node.max_x} | "
             f"status: {terminal_label(node.terminal)} | score: {node_score(node):.3f}"
@@ -261,7 +367,6 @@ def beam_audit(
     beam_width: int,
 ) -> tuple[str, tuple[str, ...]]:
     """Search a bounded, state-diverse checkpoint beam and return root action."""
-
     audit_dir = root_state_file.parent / "v5-beam"
     if audit_dir.exists():
         shutil.rmtree(audit_dir)
@@ -421,6 +526,7 @@ def worker(args: argparse.Namespace) -> None:
     episode = EpisodeAccumulator(current)
     state_file = args.state_file.expanduser().resolve()
     state_file.parent.mkdir(parents=True, exist_ok=True)
+    capture_dir = initialize_capture_dir(args.capture_dir)
     nominal_progress = 0
 
     print("\n=== Planner V5 ===", flush=True)
@@ -428,6 +534,8 @@ def worker(args: argparse.Namespace) -> None:
     print(f"Beam lookahead : up to {args.beam_depth} decisions ({args.beam_depth * 30} frames)", flush=True)
     print(f"Beam width     : keep up to {args.beam_width} distinct machine states", flush=True)
     print(f"Safety audit   : every {args.audit_interval} decisions, plus stalled/degraded states", flush=True)
+    print(f"Binary capture : worker-owned -> {capture_dir}", flush=True)
+    print("Capture scope  : authoritative root + all four immediate root-candidate endpoints", flush=True)
     print("Actions        :", flush=True)
     for candidate in CANDIDATES:
         print(f"  - {action_label(candidate.name)}", flush=True)
@@ -441,6 +549,13 @@ def worker(args: argparse.Namespace) -> None:
 
         checkpoint_frame, checkpoint_x, checkpoint_engine = save_checkpoint(core, state_file)
         checkpoint_observation = current
+        capture_authoritative_root(
+            state_file,
+            capture_dir,
+            decision,
+            checkpoint_frame,
+            checkpoint_x,
+        )
 
         one_ply = evaluate_local_candidates(
             core,
@@ -450,6 +565,8 @@ def worker(args: argparse.Namespace) -> None:
             checkpoint_engine,
             checkpoint_observation,
             args.step_timeout,
+            capture_dir=capture_dir,
+            decision=decision,
         )
         best = select_best_candidate(one_ply)
         use_audit, reason = should_audit(
@@ -518,8 +635,7 @@ def worker(args: argparse.Namespace) -> None:
         )
 
         print(
-            f"Committed state: frame={current.native_frame_id} | "
-            f"{motion_summary(current)}",
+            f"Committed state: frame={current.native_frame_id} | {motion_summary(current)}",
             flush=True,
         )
 
@@ -551,6 +667,7 @@ def supervisor(args: argparse.Namespace) -> int:
         "--dll", str(args.dll),
         "--home", str(args.home),
         "--state-file", str(args.state_file),
+        "--capture-dir", str(args.capture_dir),
         "--max-decisions", str(args.max_decisions),
         "--step-timeout", str(args.step_timeout),
         "--beam-depth", str(args.beam_depth),
