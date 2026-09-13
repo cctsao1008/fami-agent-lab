@@ -96,6 +96,13 @@ def main() -> int:
     command = [sys.executable, str(planner), *planner_args]
 
     report_dir.mkdir(parents=True, exist_ok=True)
+    # Own a clean staging directory before worker launch. The worker will replace
+    # it once planning starts; if preflight fails first, the wrapper can still
+    # package planner.log/report.txt instead of throwing a second exception.
+    if capture_dir.exists():
+        shutil.rmtree(capture_dir)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
     temp_log = report_dir / ".fami-pixel-v7-planner-current.log"
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert process.stdout is not None
@@ -132,14 +139,18 @@ def main() -> int:
 
     code = process.wait()
     try:
-        if not capture_dir.is_dir():
-            raise FileNotFoundError(f"worker capture directory not found: {capture_dir}")
         shutil.copy2(temp_log, capture_dir / "planner.log")
+        index = capture_dir / "index.tsv"
+        lines = index.read_text(encoding="utf-8").splitlines() if index.exists() else []
+        auth = sum(1 for line in lines[1:] if line.startswith("authoritative\t"))
+        roots = sum(1 for line in lines[1:] if line.startswith("root-candidate\t"))
         report = [
             "Fami Pixel V7 B-aware Controller-Sequence Test Report",
             "====================================================",
             f"created_local: {datetime.now().astimezone().isoformat(timespec='seconds')}",
             f"exit_code: {code}",
+            f"authoritative_snapshot_count: {auth}",
+            f"root_candidate_snapshot_count: {roots}",
             "planner: V7 B-aware controller-sequence planner",
             "control_model: horizontal intent x A state x B state x frame duration",
             "command:",
@@ -150,6 +161,8 @@ def main() -> int:
         archive = Path(shutil.make_archive(str(report_dir / f"fami-pixel-v7-test-report-{stamp}"), "zip", root_dir=capture_dir.parent, base_dir=capture_dir.name))
         print("\n=== TEST REPORT READY ===", flush=True)
         print(f"Report ZIP      : {archive}", flush=True)
+        if code != 0:
+            print("Note            : worker failed before or during planning; ZIP still contains the complete failure log.", flush=True)
     finally:
         if temp_log.exists():
             temp_log.unlink()
