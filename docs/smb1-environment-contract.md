@@ -81,19 +81,25 @@ A future planning-oriented spatial projection may provide a local Mario-centered
 
 ## Action
 
-Start with a deliberately small discrete action vocabulary:
+The action contract is now B-aware and frame-duration explicit. It exposes the controller combinations needed by the official SMB1 control semantics without forcing planners to use fixed named jump macros:
 
 ```text
 NOOP
+A
+B
 RIGHT
 RIGHT_A
+RIGHT_B
+RIGHT_A_B
 LEFT
-A
+LEFT_A
+LEFT_B
+LEFT_A_B
 ```
 
-Additional combinations such as `RIGHT_B`, `RIGHT_A_B`, or `LEFT_A` may be introduced by an experiment when justified. The environment translates each logical action into an exact NES controller byte and applies it through the existing native Mesen input provider.
+The environment translates each logical action into an exact NES controller byte and applies it through the existing native Mesen input provider.
 
-The action contract is frame-duration explicit:
+The action contract remains:
 
 ```text
 ActionCommand
@@ -101,7 +107,9 @@ ActionCommand
   frame_count
 ```
 
-No wall-clock key hold is part of the environment contract.
+No wall-clock key hold is part of the environment contract. A planner may compose short `ActionCommand` sequences to represent run-up, jump hold, or airborne steering.
+
+See `docs/smb1-official-control-semantics.md` for the documentary basis and the distinction between manual control semantics and machine truth.
 
 ## Episode lifecycle
 
