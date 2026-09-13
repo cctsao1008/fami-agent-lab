@@ -1,12 +1,12 @@
 # M1 SMB1 Terminal Event Sources
 
-This note records the source basis for the first terminal events in the SMB1 environment layer.
+This note records the source basis and machine evidence for terminal events in the SMB1 environment layer.
 
-The environment does not infer death or level completion from pixels. It derives them from SMB1's own game-engine state and keeps Mesen execution as ground truth.
+The environment does not infer death or level completion from pixels. It derives them from SMB1 game-engine state and keeps Mesen execution as ground truth.
 
 ## Source basis
 
-The public SMB1 disassembly exposes `GameEngineSubroutine` through the `GameRoutines` dispatch table. The relevant entries are:
+The public SMB1 disassembly exposes `GameEngineSubroutine` through the `GameRoutines` dispatch table. Relevant entries are:
 
 ```text
 0x04  FlagpoleSlide
@@ -16,109 +16,95 @@ The public SMB1 disassembly exposes `GameEngineSubroutine` through the `GameRout
 0x0B  PlayerDeath
 ```
 
-The same disassembly shows:
-
-- normal player control running through `PlayerCtrlRoutine` (`0x08`),
-- transition into `PlayerDeath` (`0x0B`) for the death sequence,
-- flagpole handling through `FlagpoleSlide` (`0x04`), followed by `PlayerEndLevel` (`0x05`) once the flagpole sequence finishes,
-- `PlayerLoseLife` (`0x06`) as the later bookkeeping path that decrements lives and may switch to game-over mode.
-
-Public source references used for this audit:
+Public source references:
 
 - https://gist.github.com/WillSams/678a2d8a49d3f01e1d6e0362f83d1fbc
 - https://gist.github.com/dansalvato/ef1e3d34f6af710e57a876005d8b29a7
 
-## Event definitions
+## Current event definitions
 
-For M1, terminal events are edge-triggered on entry into these authoritative engine routines:
+Machine evidence refined the original death definition. SMB1 has at least two observed authoritative death-entry paths:
 
 ```text
-DIED
-  previous GameEngineSubroutine != 0x0B
-  current  GameEngineSubroutine == 0x0B
+Enemy/collision death:
+  previous engine != 0x0B
+  current  engine == 0x0B
 
-LEVEL_COMPLETED
-  previous GameEngineSubroutine != 0x05
-  current  GameEngineSubroutine == 0x05
+Pit/fall death:
+  previous engine not in {0x0B, 0x06}
+  current  engine == 0x06
+
+Level complete:
+  previous engine != 0x05
+  current  engine == 0x05
 ```
 
-The edge condition prevents the same event from being emitted again on every frame while the routine remains active.
+The `0x0B -> 0x06` transition is bookkeeping for the same death and must not emit a second `DIED` event.
 
-## Why `PlayerLoseLife` is not the death event
+## Why the death definition changed
 
-`PlayerLoseLife` (`0x06`) is later life/accounting logic. It decrements the life counter and can transition to game-over mode. For an environment transition, `PlayerDeath` (`0x0B`) is the earlier and semantically direct witness that Mario has entered the death routine.
-
-The later `0x06` path may still be useful for episode reset bookkeeping or life-count metrics.
-
-## Why `PlayerEndLevel` is the level-complete event
-
-The flagpole interaction starts earlier in `FlagpoleSlide` (`0x04`). That state means the completion sequence is in progress, not yet that the level transition has completed its flagpole stage. The next engine routine is `PlayerEndLevel` (`0x05`), which is therefore the first narrow terminal witness used by M1.
-
-This definition is intentionally local to SMB1. Other games must provide their own game-specific terminal-state sources.
-
-## Validation status
-
-Source audit: complete.
-
-Unit-level contract tests: added for `0x08 -> 0x0B` death entry, `0x04 -> 0x05` level-complete entry, and duplicate suppression while a terminal routine remains unchanged.
-
-`DIED`: machine-validated against actual World 1-1 execution.
-
-`LEVEL_COMPLETED`: still requires machine validation against an actual World 1-1 completion path.
-
-### Death probe attempt 1 — stationary Mario
-
-The first machine probe intentionally left Mario stationary after entering World 1-1. Result:
+The first death probe, driven by RIGHT with no jump, machine-validated an enemy/collision path:
 
 ```text
-GameEntry : PASS NativeFrame=196 X=40 Engine=0x08
-DeathEdge : FAIL no DIED event within 900 frames; Engine=0x08 X=40
-```
-
-This is a useful negative result: standing at the initial X position does not guarantee an enemy activation/collision path. The event definition itself was not disproved; the stimulus failed to produce a death.
-
-### Death probe attempt 2 — RIGHT, no jump
-
-The revised machine probe held RIGHT after entering World 1-1 and did not jump. This produced a real collision/death path without fabricated RAM state:
-
-```text
-GameEntry : PASS NativeFrame=196 X=40 Engine=0x08
-DeathDrive: RIGHT held, no jump; waiting for real collision/death
-Progress  : frame=316 drive=120/900 X=189 Engine=0x08
 EngineEdge: frame=387 0x08->0x0B X=295 Y=0xB0 State=1
 DeathEdge : PASS frame=387 Engine=0x0B X=295 Y=0xB0
 Duplicate : PASS no repeated DIED event
-DeathEvent: PASS actual SMB1 execution emitted exactly one DIED edge
-Supervisor: PASS
 ```
 
-This establishes the M1 `DIED` event definition as machine-validated for the current SMB1 path:
+A later World 1-1 traversal produced a different path while Mario fell into hazards:
 
 ```text
-previous GameEngineSubroutine != 0x0B
-current  GameEngineSubroutine == 0x0B
-```
-
-The observed authoritative transition was `0x08 -> 0x0B` at native frame 387. The edge-triggered event emitted exactly once, and a 12-frame duplicate-suppression window emitted no additional `DIED` events.
-
-### Level-complete probe attempt 1 — periodic grounded jumps
-
-The first real World 1-1 completion probe used RIGHT plus repeated grounded A pulses. Unit contracts remained clean (`14 passed in 0.25s`), but the gameplay baseline stalled at `X=722` and never reached a terminal engine transition before the supervisor deadline:
-
-```text
-GameEntry : PASS NativeFrame=196 X=40 Engine=0x08
-Progress  : frame=496  X=415 Engine=0x08
-Progress  : frame=796  X=722 Engine=0x08
+EngineEdge: frame=1705 0x08->0x06 X=1542 Y=0x04 State=1
 ...
-Progress  : frame=5296 X=722 Engine=0x08
-Supervisor: FAIL (worker exit code 1)
+EngineEdge: frame=3013 0x08->0x06 X=2588 Y=0x02 State=1
 ```
 
-This does not contradict the `LEVEL_COMPLETED` event definition. It shows that the first scripted baseline was not sufficient to traverse the obstacle at the observed `X=722` plateau, and that the original 180-second supervisor window was too short for the configured 7200-frame run.
+There was no intermediate `0x0B` in those traces. Therefore `0x06 PlayerLoseLife` cannot be treated only as post-death bookkeeping; when entered directly from active play it is itself the first authoritative death witness for pit/fall deaths.
 
-The completion probe was therefore revised in two ways without fabricating game state:
+This is exactly why M1 keeps event semantics subordinate to machine evidence rather than freezing a source-only interpretation.
 
-1. extend the supervisor timeout to 600 seconds,
-2. detect lack of forward progress and escalate grounded jumps to a longer A hold while continuing RIGHT.
+## Level-complete status
 
-The revised probe logs `StallJump` and `max_x` so future failures identify whether the controller actually escapes the plateau.
+`LEVEL_COMPLETED` remains defined as entry into `0x05 PlayerEndLevel`. `0x04 FlagpoleSlide` means the flagpole sequence is in progress, not yet the selected M1 terminal witness.
+
+Current validation status:
+
+```text
+DIED / enemy collision
+  source-audited       yes
+  unit-tested          yes
+  machine-validated    yes (0x08 -> 0x0B)
+
+DIED / pit-fall
+  source-audited       yes
+  unit-tested          yes
+  machine-observed     yes (0x08 -> 0x06 at X=1542 and X=2588)
+
+LEVEL_COMPLETED
+  source-audited       yes
+  unit-tested          yes
+  machine-validated    pending
+```
+
+## World 1-1 completion probe history
+
+### Attempt 1 — periodic grounded jumps
+
+The first traversal stalled at `X=722`; this showed the baseline was insufficient and the original supervisor deadline was too short.
+
+### Attempt 2 — stall recovery
+
+The revised baseline added longer jumps when forward progress stalled. It successfully escaped the `X=722` plateau and reached substantially farther:
+
+```text
+X=722  -> stall recovery
+X=1542 -> direct 0x08->0x06 pit/fall death
+restart/checkpoint -> X=1320
+X=2588 -> direct 0x08->0x06 pit/fall death
+restart/checkpoint -> X=1320
+later third-life/game-over path eventually returned to X=40
+```
+
+The important result is not merely that the baseline failed to finish. It exposed two repeatable hazard regions around the observed death coordinates and, more importantly, discovered the direct `0x06` death path.
+
+The next traversal revision therefore uses machine-derived pre-emptive long-jump windows before those hazards instead of waiting for a stall after Mario is already in danger. The windows are experiment policy, not game truth; their evidence source is this trace.
