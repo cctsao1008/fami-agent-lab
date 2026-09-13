@@ -191,10 +191,12 @@ RELEASE x2
 Observed result:
 
 ```text
-Mario X: 40 → 117  (delta +77)
-Jump:    observed (11 non-ground frames)
-Y range: 0x8A..0xB0
-Release: SMB joypad returned to 0x00
+Title menu:  NativeFrame=33, OperMode=0, Task=3
+Game entry:  NativeFrame=196, OperMode=1, Engine=0x08, World 1-1
+Mario X:     40 → 117  (delta +77)
+Jump:        observed (11 non-ground frames)
+Y range:     0x8A..0xB0
+Release:     SMB joypad returned to 0x00
 ```
 
-This establishes that Fami Pixel can drive actual SMB gameplay and observe resulting game state directly, not merely inject controller bytes.
+This establishes that Fami Pixel can enter SMB gameplay, drive actual Mario movement/jump behavior, and observe resulting game state directly rather than merely inject controller bytes.
