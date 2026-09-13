@@ -14,6 +14,7 @@ Set-StrictMode -Version Latest
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $MesenRoot = Join-Path $RepoRoot "modules\mesen"
+$Solution = Join-Path $MesenRoot "Mesen.sln"
 $Project = Join-Path $MesenRoot "InteropDLL\InteropDLL.vcxproj"
 $StageDir = Join-Path $RepoRoot "build\mesen"
 $SourceDll = Join-Path $MesenRoot "bin\win-x64\$Configuration\MesenCore.dll"
@@ -43,11 +44,13 @@ function Find-MSBuild {
     throw "MSBuild.exe was not found. Install Visual Studio 2022/2026 with Desktop development with C++."
 }
 
-if (-not (Test-Path $Project)) {
+if (-not (Test-Path $Solution) -or -not (Test-Path $Project)) {
     throw @"
 Mesen CE submodule is not initialized.
 Run:
     git submodule update --init --recursive
+Expected solution:
+    $Solution
 Expected project:
     $Project
 "@
@@ -57,14 +60,20 @@ $MSBuild = Find-MSBuild
 Write-Host "Repository : $RepoRoot"
 Write-Host "Mesen      : $MesenRoot"
 Write-Host "MSBuild    : $MSBuild"
-Write-Host "Project    : $Project"
+Write-Host "Solution   : $Solution"
+Write-Host "Target     : InteropDLL"
 Write-Host "Config     : $Configuration|$Platform"
 Write-Host
 
-& $MSBuild $Project `
+# Build through Mesen.sln rather than invoking InteropDLL.vcxproj directly.
+# Several Mesen projects derive their include paths and output directories from
+# $(SolutionDir); direct project invocation leaves that property without the
+# solution context and causes includes such as Utilities/... and Core/... to fail.
+& $MSBuild $Solution `
     /m `
     /nologo `
     /verbosity:minimal `
+    /t:InteropDLL `
     "/p:Configuration=$Configuration" `
     "/p:Platform=$Platform"
 
