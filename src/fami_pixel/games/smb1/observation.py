@@ -6,7 +6,12 @@ from dataclasses import dataclass
 
 from fami_pixel.adapters.mesen import MesenCore
 
-from .state import Smb1State, read_smb1_state
+from .state import (
+    GAME_MODE,
+    PLAYER_CONTROL_SUBROUTINE,
+    Smb1State,
+    read_smb1_state,
+)
 
 
 @dataclass(frozen=True)
@@ -38,7 +43,10 @@ class Smb1Observation:
 
     @property
     def is_player_control(self) -> bool:
-        return self.game_engine_subroutine == 0x08 and self.oper_mode == 1
+        return (
+            self.oper_mode == GAME_MODE
+            and self.game_engine_subroutine == PLAYER_CONTROL_SUBROUTINE
+        )
 
 
 def observation_from_state(native_frame_id: int, state: Smb1State) -> Smb1Observation:
