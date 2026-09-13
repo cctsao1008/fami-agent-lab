@@ -53,11 +53,12 @@ def main() -> int:
         print(f"DbgRunning: {core.is_debugger_running()}")
         print(f"ExecStop  : {core.is_execution_stopped()}")
 
-        core.release_debugger()
-        print(f"DbgRelease: {'PASS' if not core.is_debugger_running() else 'FAIL'}")
-
+        # Keep the debugger attached during Stop(). Upstream Emulator::Stop()
+        # owns debugger reset/teardown. Releasing the debugger first while the
+        # emulation thread is live can leave Stop() waiting on that thread.
         core.stop()
         print("Stop      : PASS")
+        print(f"DbgRunning: {core.is_debugger_running()}")
 
     print("Release   : PASS")
     return 0
