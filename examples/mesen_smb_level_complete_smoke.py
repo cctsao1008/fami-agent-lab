@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Machine-validate SMB1 LEVEL_COMPLETED through actual World 1-1 execution.
 
-The probe uses a deterministic state-based baseline. It holds RIGHT, issues
-normal jump pulses while grounded, and escalates to a longer jump when forward
-progress stalls. It never fabricates RAM state: Mesen remains the execution
-authority and the event is accepted only when the real engine enters
-PlayerEndLevel (0x05).
+The probe uses a deterministic state-based runner. Mesen remains execution
+authority; no RAM state is fabricated. The policy combines ordinary grounded
+jumps, stall recovery, and two pre-emptive long-jump windows learned from prior
+machine traces that produced direct pit/fall deaths near X=1542 and X=2588.
 """
 
 from __future__ import annotations
@@ -40,7 +39,10 @@ READY_MARKER = "WorkerReady: TERMINATE_FROM_SUPERVISOR"
 FAIL_MARKER = "WorkerFail: TERMINATE_FROM_SUPERVISOR"
 PLAYER_CONTROL = 0x08
 FLAGPOLE_SLIDE = 0x04
-PLAYER_END_LEVEL = 0x05
+
+# Experiment-policy windows derived from the previous machine trace. They are
+# not encoded as SMB1 truth; they are simply deterministic traversal hints.
+HAZARD_WINDOWS = ((1400, 1600), (2400, 2660))
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entry-max-frames", type=int, default=360)
     parser.add_argument("--run-max-frames", type=int, default=7200)
     parser.add_argument("--jump-hold-frames", type=int, default=18)
-    parser.add_argument("--stall-jump-hold-frames", type=int, default=30)
+    parser.add_argument("--long-jump-hold-frames", type=int, default=34)
     parser.add_argument("--jump-cooldown-frames", type=int, default=3)
     parser.add_argument("--stall-threshold-frames", type=int, default=24)
     parser.add_argument("--step-timeout", type=float, default=2.0)
@@ -135,18 +137,19 @@ def worker(args: argparse.Namespace) -> None:
     max_x_seen = gameplay.player_absolute_x
     stall_frames = 0
     stall_recoveries = 0
+    hazard_triggers: set[int] = set()
 
     print(
-        "Baseline  : RIGHT + grounded jumps + long-jump stall recovery; "
-        "waiting for real 1-1 completion",
+        "Baseline  : RIGHT + grounded jumps + hazard-window long jumps + stall recovery",
         flush=True,
     )
 
     for i in range(args.run_max_frames):
         state_before = read_smb1_state(core)
+        x = state_before.player_absolute_x
 
-        if state_before.player_absolute_x > max_x_seen:
-            max_x_seen = state_before.player_absolute_x
+        if x > max_x_seen:
+            max_x_seen = x
             stall_frames = 0
         elif state_before.game_engine_subroutine == PLAYER_CONTROL:
             stall_frames += 1
@@ -157,18 +160,30 @@ def worker(args: argparse.Namespace) -> None:
             and jump_hold == 0
             and jump_cooldown == 0
         ):
-            if stall_frames >= args.stall_threshold_frames:
-                jump_hold = args.stall_jump_hold_frames
+            selected_hold = args.jump_hold_frames
+            reason = None
+
+            for index, (start_x, end_x) in enumerate(HAZARD_WINDOWS):
+                if index not in hazard_triggers and start_x <= x <= end_x:
+                    selected_hold = args.long_jump_hold_frames
+                    hazard_triggers.add(index)
+                    reason = f"hazard[{index}]"
+                    break
+
+            if reason is None and stall_frames >= args.stall_threshold_frames:
+                selected_hold = args.long_jump_hold_frames
                 stall_frames = 0
                 stall_recoveries += 1
+                reason = "stall"
+
+            jump_hold = selected_hold
+            jump_count += 1
+            if reason is not None:
                 print(
-                    f"StallJump : frame={core.frame_count()} X={state_before.player_absolute_x} "
-                    f"hold={args.stall_jump_hold_frames} recovery={stall_recoveries}",
+                    f"LongJump  : frame={core.frame_count()} X={x} hold={selected_hold} "
+                    f"reason={reason} recoveries={stall_recoveries}",
                     flush=True,
                 )
-            else:
-                jump_hold = args.jump_hold_frames
-            jump_count += 1
 
         buttons = NES_RIGHT
         if jump_hold > 0:
@@ -204,14 +219,15 @@ def worker(args: argparse.Namespace) -> None:
                 result = episode.finish(EpisodeTermination.DEATH)
                 fail(
                     "LevelRun  : FAIL death before completion "
-                    f"frame={event.frame_id} max_x={result.max_x} jumps={jump_count} "
-                    f"stall_recoveries={stall_recoveries}"
+                    f"frame={event.frame_id} engine=0x{state.game_engine_subroutine:02X} "
+                    f"x={state.player_absolute_x} max_x={result.max_x} jumps={jump_count} "
+                    f"hazards={sorted(hazard_triggers)} recoveries={stall_recoveries}"
                 )
+
             if event.kind == GameEventType.LEVEL_COMPLETED:
                 level_events += 1
                 print(
-                    f"LevelEdge : PASS frame={event.frame_id} "
-                    f"Engine=0x{state.game_engine_subroutine:02X} "
+                    f"LevelEdge : PASS frame={event.frame_id} Engine=0x{state.game_engine_subroutine:02X} "
                     f"X={state.player_absolute_x}",
                     flush=True,
                 )
@@ -236,16 +252,15 @@ def worker(args: argparse.Namespace) -> None:
             print("Duplicate  : PASS no repeated LEVEL_COMPLETED event", flush=True)
             print(
                 f"Episode    : PASS termination={result.termination.value} "
-                f"frames={result.elapsed_frames} start_x={result.start_x} "
-                f"end_x={result.end_x} max_x={result.max_x} "
-                f"progress={result.net_progress} events={result.event_count} "
+                f"frames={result.elapsed_frames} start_x={result.start_x} end_x={result.end_x} "
+                f"max_x={result.max_x} progress={result.net_progress} events={result.event_count} "
                 f"jumps={result.jump_events} landings={result.landing_events}",
                 flush=True,
             )
             print(
                 f"LevelEvent : PASS actual SMB1 execution emitted exactly one "
                 f"LEVEL_COMPLETED edge; flagpole_seen={saw_flagpole} "
-                f"stall_recoveries={stall_recoveries}",
+                f"hazards={sorted(hazard_triggers)} recoveries={stall_recoveries}",
                 flush=True,
             )
             print(READY_MARKER, flush=True)
@@ -254,9 +269,9 @@ def worker(args: argparse.Namespace) -> None:
         if (i + 1) % 300 == 0:
             print(
                 f"Progress  : frame={current.native_frame_id} run={i + 1}/{args.run_max_frames} "
-                f"X={state.player_absolute_x} max_x={max_x_seen} "
-                f"stall={stall_frames} Engine=0x{state.game_engine_subroutine:02X} "
-                f"State={state.player_state} jumps={jump_count} "
+                f"X={state.player_absolute_x} max_x={max_x_seen} stall={stall_frames} "
+                f"Engine=0x{state.game_engine_subroutine:02X} State={state.player_state} "
+                f"jumps={jump_count} hazards={sorted(hazard_triggers)} "
                 f"recoveries={stall_recoveries}",
                 flush=True,
             )
@@ -269,7 +284,7 @@ def worker(args: argparse.Namespace) -> None:
         f"LevelRun  : FAIL timeout frames={result.elapsed_frames} max_x={result.max_x} "
         f"Engine=0x{read_smb1_state(core).game_engine_subroutine:02X} "
         f"flagpole_seen={saw_flagpole} jumps={jump_count} "
-        f"stall_recoveries={stall_recoveries}"
+        f"hazards={sorted(hazard_triggers)} recoveries={stall_recoveries}"
     )
 
 
@@ -284,7 +299,7 @@ def supervisor(args: argparse.Namespace) -> int:
         "--entry-max-frames", str(args.entry_max_frames),
         "--run-max-frames", str(args.run_max_frames),
         "--jump-hold-frames", str(args.jump_hold_frames),
-        "--stall-jump-hold-frames", str(args.stall_jump_hold_frames),
+        "--long-jump-hold-frames", str(args.long_jump_hold_frames),
         "--jump-cooldown-frames", str(args.jump_cooldown_frames),
         "--stall-threshold-frames", str(args.stall_threshold_frames),
         "--step-timeout", str(args.step_timeout),
