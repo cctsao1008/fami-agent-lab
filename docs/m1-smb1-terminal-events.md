@@ -60,6 +60,8 @@ This definition is intentionally local to SMB1. Other games must provide their o
 
 Source audit: complete.
 
-Unit-level contract tests: added for `0x08 -> 0x0B` death entry, `0x04 -> 0x05` level-complete entry, and duplicate suppression while a terminal routine remains unchanged.
+Unit-level contract tests: implemented for `0x08 -> 0x0B` death entry, `0x04 -> 0x05` level-complete entry, and duplicate suppression while a terminal routine remains unchanged.
+
+The preceding non-terminal M1 contract slice was machine-independent and passed locally as `8 passed`. The newly added terminal-event tests still require a fresh local pytest run after pulling these commits.
 
 Machine validation against an actual death and actual 1-1 completion remains required before these terminal events are considered fully machine-validated.
