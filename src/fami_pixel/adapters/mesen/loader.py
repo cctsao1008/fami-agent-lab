@@ -54,6 +54,8 @@ M0_EXPORTS: tuple[str, ...] = (
     "LoadState",
     "SaveStateFile",
     "LoadStateFile",
+    "FamiPixelStepFrame",
+    "FamiPixelGetFrameCount",
 )
 
 
@@ -77,6 +79,7 @@ class MesenCore:
         self._initialized = False
         self._debugger_initialized = False
         self._released = False
+        self._fami_pixel_exports_bound = False
         self._bind_verified_exports()
 
     def _bind_verified_exports(self) -> None:
@@ -149,6 +152,21 @@ class MesenCore:
             raise MesenLoadError(
                 "Loaded DLL does not expose the expected verified Mesen CE ABI."
             ) from exc
+
+    def _bind_fami_pixel_exports(self) -> None:
+        if self._fami_pixel_exports_bound:
+            return
+        try:
+            self._dll.FamiPixelStepFrame.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            self._dll.FamiPixelStepFrame.restype = ctypes.c_int32
+            self._dll.FamiPixelGetFrameCount.argtypes = []
+            self._dll.FamiPixelGetFrameCount.restype = ctypes.c_uint32
+        except AttributeError as exc:
+            raise MesenLoadError(
+                "MesenCore.dll does not contain the fami-pixel synchronous frame-step extension; "
+                "rebuild from the pinned cctsao1008/MesenCE submodule revision."
+            ) from exc
+        self._fami_pixel_exports_bound = True
 
     @staticmethod
     def _native_path(path: Path) -> bytes:
@@ -238,20 +256,51 @@ class MesenCore:
         self._dll.ResumeExecution()
 
     def step_ppu_frame(self, count: int = 1) -> None:
-        """Install a NES PPU-frame debugger step request.
+        """Issue the stock asynchronous debugger PPU-frame request.
 
-        Do not pair this with ResumeExecution() after the call: upstream
-        Debugger::Run(), which backs ResumeExecution(), clears each CPU
-        debugger's current StepRequest. DebugBreakHelper inside Step() is
-        responsible for the temporary host-thread break/release around request
-        installation. Completion must be witnessed separately; a stale
-        IsExecutionStopped()==True is not sufficient evidence of advancement.
+        This method is retained for ABI/debugger research. It is not the M0
+        deterministic runtime primitive because host-side stopped-state polling
+        can observe the previous break before the emulation thread has resumed.
+        Use step_frame_sync() for the fami-pixel control loop.
         """
         if not self._debugger_initialized:
             raise MesenLoadError("initialize_debugger() must be called before stepping.")
         if count < 1:
             raise ValueError("count must be >= 1")
         self._dll.Step(CPU_TYPE_NES, count, STEP_TYPE_PPU_FRAME)
+
+    def frame_count(self) -> int:
+        """Return the native emulator frame counter from the fami-pixel extension."""
+        self._bind_fami_pixel_exports()
+        return int(self._dll.FamiPixelGetFrameCount())
+
+    def step_frame_sync(self, count: int = 1, timeout_ms: int = 2000) -> None:
+        """Synchronously advance exactly `count` NES PPU frames.
+
+        The fork-side wrapper installs Mesen's native PPU-frame step request,
+        waits for the emulator frame counter to advance by the requested count,
+        and then waits for the debugger to reach the new stopped state. A
+        non-zero native status is treated as a contract failure.
+        """
+        if not self._debugger_initialized:
+            raise MesenLoadError("initialize_debugger() must be called before stepping.")
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be >= 0")
+
+        self._bind_fami_pixel_exports()
+        status = int(self._dll.FamiPixelStepFrame(count, timeout_ms))
+        if status != 0:
+            meanings = {
+                1: "emulator is not running",
+                2: "debugger is not initialized",
+                3: "invalid frame count",
+                4: "timeout waiting for native frame advance",
+                5: "timeout waiting for the new debugger stop",
+            }
+            detail = meanings.get(status, "unknown native status")
+            raise MesenLoadError(f"FamiPixelStepFrame failed ({status}: {detail}).")
 
     def stop(self) -> None:
         if self._initialized and not self._released:
