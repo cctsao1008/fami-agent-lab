@@ -120,6 +120,17 @@ InitDll
 
 `examples/mesen_headless_boot.py` validates this path against a user-supplied local ROM. ROMs remain local and are not stored in this repository.
 
+This path has been machine-validated on Windows against a local Super Mario Bros. NES ROM with:
+
+```text
+Init      : PASS
+LoadRom   : PASS
+IsRunning : True
+IsPaused  : False
+Stop      : PASS
+Release   : PASS
+```
+
 ## Verified debugger lifecycle
 
 The pinned Mesen CE source defines and the adapter now binds:
