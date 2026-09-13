@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import re
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -98,6 +100,7 @@ FIXTURE_X = {
     "collapse-boundary": 1136,
     "doomed": 1266,
 }
+_FIXTURE_NAME_RE = re.compile(r"frame-(\d+)-X-(\d+)\.mss$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,22 +127,69 @@ def action_label(name: str) -> str:
     return ACTION_LABELS.get(name, v6.action_label(name))
 
 
-def load_state(core: MesenCore, path: Path):
-    source = path.expanduser().resolve()
-    if not source.is_file() or source.stat().st_size <= 0:
-        raise FileNotFoundError(f"save state not found or empty: {source}")
-    set_nes_controller_state(core, 0, 0x00)
-    before = core.frame_count()
-    core.load_state_file(source)
-    import time
-    deadline = time.monotonic() + 3.0
+def _wait_for_fixture(core: MesenCore, *, expected_frame: int | None, expected_x: int | None, timeout_s: float = 3.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
     while time.monotonic() < deadline:
         state = read_smb1_state(core)
         obs = observation_from_state(core.frame_count(), state)
-        if obs.native_frame_id != before and state.oper_mode == 1:
-            return obs
-        time.sleep(0.005)
-    raise RuntimeError(f"save-state load did not become visible: {source}")
+        last = obs
+        if state.oper_mode == 1:
+            frame_ok = expected_frame is None or obs.native_frame_id == expected_frame
+            x_ok = expected_x is None or obs.mario_x_abs == expected_x
+            if frame_ok and x_ok:
+                return obs
+        time.sleep(0.001)
+    if last is None:
+        raise RuntimeError("save-state load produced no readable SMB1 state")
+    raise RuntimeError(
+        "save-state load did not reach expected fixture state: "
+        f"expected_frame={expected_frame} expected_x={expected_x} "
+        f"actual_frame={last.native_frame_id} actual_x={last.mario_x_abs} "
+        f"engine=0x{last.game_engine_subroutine:02X}"
+    )
+
+
+def load_state(core: MesenCore, path: Path):
+    """Load an external fixture and hand execution back to synchronous frame-step control.
+
+    A freshly loaded ROM is still free-running. Loading an .mss can therefore be
+    observed correctly for an instant and then drift hundreds of frames before
+    the first planner checkpoint is saved. Prime the native synchronous
+    frame-step path once, then reload the exact fixture so planning starts from
+    the captured authoritative frame rather than the drifted state.
+    """
+    source = path.expanduser().resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise FileNotFoundError(f"save state not found or empty: {source}")
+
+    match = _FIXTURE_NAME_RE.search(source.name)
+    expected_frame = int(match.group(1)) if match else None
+    expected_x = int(match.group(2)) if match else None
+
+    set_nes_controller_state(core, 0, 0x00)
+    core.load_state_file(source)
+    first = _wait_for_fixture(core, expected_frame=expected_frame, expected_x=expected_x)
+
+    # Do not require IsExecutionStopped() here. FamiPixelStepFrame is the
+    # validated synchronization primitive and can establish debugger ownership
+    # from a running state. The single priming frame is discarded immediately.
+    core.step_frame_sync(1, 5000)
+
+    # Rewind to the exact captured fixture now that synchronous debugger frame
+    # control has been established.
+    set_nes_controller_state(core, 0, 0x00)
+    core.load_state_file(source)
+    exact = _wait_for_fixture(
+        core,
+        expected_frame=expected_frame if expected_frame is not None else first.native_frame_id,
+        expected_x=expected_x if expected_x is not None else first.mario_x_abs,
+    )
+    print(
+        f"FixtureSync: PASS exact frame={exact.native_frame_id} X={exact.mario_x_abs}",
+        flush=True,
+    )
+    return exact
 
 
 def _report_candidates() -> list[Path]:
@@ -169,8 +219,6 @@ def resolve_report_zip(requested: Path | None) -> Path:
         if resolved.is_file():
             return resolved
 
-        # If the caller supplied a display/example path (for example D:\...\file.zip),
-        # recover by basename before falling back to the newest report.
         basename = direct.name
         if basename and basename not in {".", ".."}:
             for candidate in _report_candidates():
