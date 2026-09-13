@@ -94,13 +94,8 @@ def test_observation_projects_authoritative_state() -> None:
 def test_events_derive_movement_and_jump_start() -> None:
     previous = _observation(256, x=99, state=0)
     current = _observation(257, x=100, state=1, y=0xAC)
-
     events = derive_game_events(previous, current)
-
-    assert [event.kind for event in events] == [
-        GameEventType.MOVED,
-        GameEventType.JUMP_STARTED,
-    ]
+    assert [event.kind for event in events] == [GameEventType.MOVED, GameEventType.JUMP_STARTED]
     assert events[0].delta_x == 1
     assert events[0].frame_id == 257
 
@@ -108,43 +103,42 @@ def test_events_derive_movement_and_jump_start() -> None:
 def test_events_derive_landing() -> None:
     previous = _observation(280, x=130, state=1, y=0xA0)
     current = _observation(281, x=131, state=0, y=0xB0)
-
     events = derive_game_events(previous, current)
-
-    assert [event.kind for event in events] == [
-        GameEventType.MOVED,
-        GameEventType.LANDED,
-    ]
+    assert [event.kind for event in events] == [GameEventType.MOVED, GameEventType.LANDED]
 
 
 def test_events_derive_death_on_player_death_routine_entry() -> None:
     previous = _observation(300, x=140, state=0, engine=0x08)
     current = _observation(301, x=140, state=0, engine=0x0B)
+    assert [event.kind for event in derive_game_events(previous, current)] == [GameEventType.DIED]
 
-    events = derive_game_events(previous, current)
 
-    assert [event.kind for event in events] == [GameEventType.DIED]
+def test_events_derive_death_on_direct_lose_life_entry() -> None:
+    previous = _observation(320, x=1542, state=1, y=0x04, engine=0x08)
+    current = _observation(321, x=1542, state=1, y=0x04, engine=0x06)
+    assert [event.kind for event in derive_game_events(previous, current)] == [GameEventType.DIED]
+
+
+def test_player_death_to_lose_life_does_not_duplicate_death() -> None:
+    previous = _observation(330, x=295, state=1, engine=0x0B)
+    current = _observation(331, x=295, state=1, engine=0x06)
+    assert derive_game_events(previous, current) == ()
 
 
 def test_events_derive_level_complete_on_player_end_level_entry() -> None:
     previous = _observation(400, x=3000, state=3, engine=0x04)
     current = _observation(401, x=3000, state=3, engine=0x05)
-
-    events = derive_game_events(previous, current)
-
-    assert [event.kind for event in events] == [GameEventType.LEVEL_COMPLETED]
+    assert [event.kind for event in derive_game_events(previous, current)] == [GameEventType.LEVEL_COMPLETED]
 
 
 def test_terminal_events_do_not_repeat_while_routine_is_unchanged() -> None:
     previous = _observation(500, x=140, state=0, engine=0x0B)
     current = _observation(501, x=140, state=0, engine=0x0B)
-
     assert derive_game_events(previous, current) == ()
 
 
 def test_events_reject_nonmonotonic_frames() -> None:
     previous = _observation(257, x=100, state=0)
     current = _observation(257, x=101, state=0)
-
     with pytest.raises(ValueError):
         derive_game_events(previous, current)
