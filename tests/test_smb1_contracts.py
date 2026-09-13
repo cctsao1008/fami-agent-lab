@@ -1,3 +1,5 @@
+import pytest
+
 from fami_pixel.adapters.mesen import NES_A, NES_LEFT, NES_RIGHT
 from fami_pixel.games.smb1 import (
     ActionCommand,
@@ -39,6 +41,11 @@ def test_action_command_is_frame_explicit() -> None:
     command = ActionCommand(Smb1Action.RIGHT_A, 10)
     assert command.frame_count == 10
     assert command.nes_buttons == (NES_RIGHT | NES_A)
+
+
+def test_action_command_rejects_nonpositive_duration() -> None:
+    with pytest.raises(ValueError):
+        ActionCommand(Smb1Action.NOOP, 0)
 
 
 def test_observation_projects_authoritative_state() -> None:
