@@ -24,9 +24,11 @@ def bind_fami_pixel_input_api(core: MesenCore) -> None:
             ctypes.c_uint8,
         ]
         core._dll.FamiPixelSetNesControllerState.restype = ctypes.c_int32
+        core._dll.FamiPixelGetNesControllerState.argtypes = [ctypes.c_uint32]
+        core._dll.FamiPixelGetNesControllerState.restype = ctypes.c_int32
     except AttributeError as exc:
         raise MesenLoadError(
-            "MesenCore.dll is missing the fami-pixel native input export. "
+            "MesenCore.dll is missing the fami-pixel native input exports. "
             "Rebuild the pinned cctsao1008/MesenCE fork."
         ) from exc
 
@@ -54,3 +56,16 @@ def set_nes_controller_state(core: MesenCore, port: int, buttons: int) -> None:
         raise MesenLoadError(
             f"FamiPixelSetNesControllerState failed ({status}: {detail})."
         )
+
+
+def get_nes_controller_state(core: MesenCore, port: int = 0) -> int:
+    """Read the actual current byte stored in the emulated NES controller."""
+    if not 0 <= port <= 1:
+        raise ValueError("NES controller port must be 0 or 1")
+    bind_fami_pixel_input_api(core)
+    value = int(core._dll.FamiPixelGetNesControllerState(port))
+    if value < 0:
+        raise MesenLoadError(
+            "FamiPixelGetNesControllerState could not resolve an active NES controller."
+        )
+    return value
