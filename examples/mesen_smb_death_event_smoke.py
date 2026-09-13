@@ -14,6 +14,7 @@ from pathlib import Path
 from fami_pixel.adapters.mesen import (
     MesenCore,
     MesenLoadError,
+    NES_RIGHT,
     NES_START,
     configure_standard_nes_controller,
     set_nes_controller_state,
@@ -32,7 +33,10 @@ PLAYER_DEATH_ROUTINE = 0x0B
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Enter SMB1 World 1-1, stand still, and validate actual DIED event entry."
+        description=(
+            "Enter SMB1 World 1-1, walk right without jumping, and validate "
+            "actual DIED event entry."
+        )
     )
     parser.add_argument("rom", type=Path)
     parser.add_argument("--dll", type=Path, default=Path("build/mesen/MesenCore.dll"))
@@ -112,8 +116,13 @@ def worker(args: argparse.Namespace) -> None:
         flush=True,
     )
 
+    # Standing still at X=40 does not force the first enemy into an active/collision
+    # path. Drive right without A so normal World 1-1 execution produces an actual
+    # collision/death rather than fabricating terminal RAM state.
     previous = observation_from_state(core.frame_count(), gameplay)
-    set_nes_controller_state(core, 0, 0x00)
+    previous_engine = gameplay.game_engine_subroutine
+    set_nes_controller_state(core, 0, NES_RIGHT)
+    print("DeathDrive: RIGHT held, no jump; waiting for real collision/death", flush=True)
 
     death_events = 0
     death_frame = None
@@ -122,22 +131,40 @@ def worker(args: argparse.Namespace) -> None:
         state = read_smb1_state(core)
         current = observation_from_state(core.frame_count(), state)
         events = derive_game_events(previous, current)
+
+        if state.game_engine_subroutine != previous_engine:
+            print(
+                f"EngineEdge: frame={current.native_frame_id} "
+                f"0x{previous_engine:02X}->0x{state.game_engine_subroutine:02X} "
+                f"X={state.player_absolute_x} Y=0x{state.player_y:02X} "
+                f"State={state.player_state}",
+                flush=True,
+            )
+            previous_engine = state.game_engine_subroutine
+
+        if (i + 1) % 120 == 0:
+            print(
+                f"Progress  : frame={current.native_frame_id} "
+                f"drive={i + 1}/{args.death_max_frames} "
+                f"X={state.player_absolute_x} Engine=0x{state.game_engine_subroutine:02X}",
+                flush=True,
+            )
+
         for event in events:
             if event.kind == GameEventType.DIED:
                 death_events += 1
                 death_frame = event.frame_id
+                set_nes_controller_state(core, 0, 0x00)
                 print(
                     f"DeathEdge : PASS frame={event.frame_id} "
                     f"Engine=0x{state.game_engine_subroutine:02X} X={state.player_absolute_x} "
                     f"Y=0x{state.player_y:02X}",
                     flush=True,
                 )
+
         if death_events:
-            # Step a few more frames to prove edge-triggered duplicate suppression.
-            duplicate_window = 0
             duplicate_events = 0
-            while duplicate_window < 12:
-                duplicate_window += 1
+            for _ in range(12):
                 previous = current
                 step(core, args.step_timeout)
                 state = read_smb1_state(core)
@@ -156,6 +183,7 @@ def worker(args: argparse.Namespace) -> None:
             break
         previous = current
     else:
+        set_nes_controller_state(core, 0, 0x00)
         final = read_smb1_state(core)
         print(
             f"DeathEdge : FAIL no DIED event within {args.death_max_frames} frames; "
