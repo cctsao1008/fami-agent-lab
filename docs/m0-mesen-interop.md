@@ -51,6 +51,44 @@ Do not bind enum- or struct-heavy APIs until their exact upstream declarations a
 
 This avoids creating an ABI that merely appears to work on one build.
 
+## Project-controlled Mesen build
+
+Mesen CE is pinned as the `modules/mesen` Git submodule. The pinned upstream project that produces the native DLL is:
+
+```text
+modules/mesen/InteropDLL/InteropDLL.vcxproj
+```
+
+For `Release|x64`, the upstream project explicitly defines:
+
+```text
+TargetName = MesenCore
+OutDir     = <Mesen solution>/bin/win-x64/Release/
+```
+
+Therefore the expected upstream build artifact is:
+
+```text
+modules/mesen/bin/win-x64/Release/MesenCore.dll
+```
+
+`tools/build_mesen.ps1` builds that project with MSBuild, stages the result at:
+
+```text
+build/mesen/MesenCore.dll
+```
+
+and runs the M0 ABI probe unless `-SkipProbe` is specified.
+
+On a fresh clone:
+
+```powershell
+git submodule update --init --recursive
+.\tools\build_mesen.ps1
+```
+
+The script requires Visual Studio 2022/2026 with the C++ desktop toolchain and locates `MSBuild.exe` through PATH or `vswhere.exe`.
+
 ## First probe
 
 Install the package in editable mode, then run on Windows:
