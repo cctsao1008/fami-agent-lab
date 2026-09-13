@@ -10,25 +10,35 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from fami_pixel.adapters.mesen import NES_A, NES_LEFT, NES_RIGHT
+from fami_pixel.adapters.mesen import NES_A, NES_B, NES_LEFT, NES_RIGHT
 
 
 class Smb1Action(str, Enum):
     NOOP = "NOOP"
+    A = "A"
+    B = "B"
     RIGHT = "RIGHT"
     RIGHT_A = "RIGHT_A"
+    RIGHT_B = "RIGHT_B"
+    RIGHT_A_B = "RIGHT_A_B"
     LEFT = "LEFT"
     LEFT_A = "LEFT_A"
-    A = "A"
+    LEFT_B = "LEFT_B"
+    LEFT_A_B = "LEFT_A_B"
 
 
 _ACTION_TO_BUTTONS: dict[Smb1Action, int] = {
     Smb1Action.NOOP: 0x00,
+    Smb1Action.A: NES_A,
+    Smb1Action.B: NES_B,
     Smb1Action.RIGHT: NES_RIGHT,
     Smb1Action.RIGHT_A: NES_RIGHT | NES_A,
+    Smb1Action.RIGHT_B: NES_RIGHT | NES_B,
+    Smb1Action.RIGHT_A_B: NES_RIGHT | NES_A | NES_B,
     Smb1Action.LEFT: NES_LEFT,
     Smb1Action.LEFT_A: NES_LEFT | NES_A,
-    Smb1Action.A: NES_A,
+    Smb1Action.LEFT_B: NES_LEFT | NES_B,
+    Smb1Action.LEFT_A_B: NES_LEFT | NES_A | NES_B,
 }
 
 
