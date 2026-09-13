@@ -17,12 +17,10 @@ class MesenLoadError(RuntimeError):
     """Raised when MesenCore.dll cannot be loaded or a verified call fails."""
 
 
-# Verified enum values from the pinned Mesen CE source.
 CPU_TYPE_NES = 8
 STEP_TYPE_PPU_FRAME = 6
 
 
-# Exports relevant to M0. Presence can be checked without guessing struct layouts.
 M0_EXPORTS: tuple[str, ...] = (
     "TestDll",
     "GetMesenVersion",
@@ -56,6 +54,8 @@ M0_EXPORTS: tuple[str, ...] = (
     "LoadStateFile",
     "FamiPixelStepFrame",
     "FamiPixelGetFrameCount",
+    "FamiPixelSetNesControllerState",
+    "FamiPixelGetNesControllerState",
 )
 
 
@@ -83,20 +83,15 @@ class MesenCore:
         self._bind_verified_exports()
 
     def _bind_verified_exports(self) -> None:
-        """Bind only exact signatures verified in the pinned upstream source."""
         try:
             self._dll.TestDll.argtypes = []
             self._dll.TestDll.restype = ctypes.c_bool
-
             self._dll.GetMesenVersion.argtypes = []
             self._dll.GetMesenVersion.restype = ctypes.c_uint32
-
             self._dll.GetMesenBuildDate.argtypes = []
             self._dll.GetMesenBuildDate.restype = ctypes.c_char_p
-
             self._dll.InitDll.argtypes = []
             self._dll.InitDll.restype = None
-
             self._dll.InitializeEmu.argtypes = [
                 ctypes.c_char_p,
                 ctypes.c_void_p,
@@ -107,45 +102,30 @@ class MesenCore:
                 ctypes.c_bool,
             ]
             self._dll.InitializeEmu.restype = None
-
             self._dll.LoadRom.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
             self._dll.LoadRom.restype = ctypes.c_bool
-
             self._dll.IsRunning.argtypes = []
             self._dll.IsRunning.restype = ctypes.c_bool
-
             self._dll.IsPaused.argtypes = []
             self._dll.IsPaused.restype = ctypes.c_bool
-
             self._dll.Pause.argtypes = []
             self._dll.Pause.restype = None
-
             self._dll.Resume.argtypes = []
             self._dll.Resume.restype = None
-
             self._dll.Stop.argtypes = []
             self._dll.Stop.restype = None
-
             self._dll.InitializeDebugger.argtypes = []
             self._dll.InitializeDebugger.restype = None
-
             self._dll.ReleaseDebugger.argtypes = []
             self._dll.ReleaseDebugger.restype = None
-
             self._dll.IsDebuggerRunning.argtypes = []
             self._dll.IsDebuggerRunning.restype = ctypes.c_bool
-
             self._dll.IsExecutionStopped.argtypes = []
             self._dll.IsExecutionStopped.restype = ctypes.c_bool
-
             self._dll.ResumeExecution.argtypes = []
             self._dll.ResumeExecution.restype = None
-
-            # CpuType is uint8_t in pinned source. StepType uses the default int
-            # enum representation. The exported count is uint32_t.
             self._dll.Step.argtypes = [ctypes.c_uint8, ctypes.c_uint32, ctypes.c_int]
             self._dll.Step.restype = None
-
             self._dll.Release.argtypes = []
             self._dll.Release.restype = None
         except AttributeError as exc:
@@ -170,7 +150,6 @@ class MesenCore:
 
     @staticmethod
     def _native_path(path: Path) -> bytes:
-        """Encode a Windows path for Mesen's narrow-char interop API."""
         return os.fsencode(str(path))
 
     def smoke_test(self) -> bool:
@@ -190,30 +169,20 @@ class MesenCore:
             raise MesenLoadError("MesenCore instance has already been released.")
         if self._initialized:
             return
-
         home = Path(home_folder).expanduser().resolve()
         home.mkdir(parents=True, exist_ok=True)
-
         self._dll.InitDll()
         self._dll.InitializeEmu(
-            self._native_path(home),
-            None,
-            None,
-            True,
-            True,
-            True,
-            True,
+            self._native_path(home), None, None, True, True, True, True
         )
         self._initialized = True
 
     def load_rom(self, rom_path: str | os.PathLike[str]) -> bool:
         if not self._initialized:
             raise MesenLoadError("initialize_headless() must be called before load_rom().")
-
         rom = Path(rom_path).expanduser().resolve()
         if not rom.is_file():
             raise MesenLoadError(f"ROM not found: {rom}")
-
         return bool(self._dll.LoadRom(self._native_path(rom), None))
 
     def is_running(self) -> bool:
@@ -237,7 +206,6 @@ class MesenCore:
             raise MesenLoadError("MesenCore instance has already been released.")
         if self._debugger_initialized:
             return
-
         self._dll.InitializeDebugger()
         self._debugger_initialized = True
 
@@ -256,13 +224,7 @@ class MesenCore:
         self._dll.ResumeExecution()
 
     def step_ppu_frame(self, count: int = 1) -> None:
-        """Issue the stock asynchronous debugger PPU-frame request.
-
-        This method is retained for ABI/debugger research. It is not the M0
-        deterministic runtime primitive because host-side stopped-state polling
-        can observe the previous break before the emulation thread has resumed.
-        Use step_frame_sync() for the fami-pixel control loop.
-        """
+        """Issue the stock asynchronous debugger PPU-frame request."""
         if not self._debugger_initialized:
             raise MesenLoadError("initialize_debugger() must be called before stepping.")
         if count < 1:
@@ -270,25 +232,16 @@ class MesenCore:
         self._dll.Step(CPU_TYPE_NES, count, STEP_TYPE_PPU_FRAME)
 
     def frame_count(self) -> int:
-        """Return the native emulator frame counter from the fami-pixel extension."""
         self._bind_fami_pixel_exports()
         return int(self._dll.FamiPixelGetFrameCount())
 
     def step_frame_sync(self, count: int = 1, timeout_ms: int = 2000) -> None:
-        """Synchronously advance exactly `count` NES PPU frames.
-
-        The fork-side wrapper installs Mesen's native PPU-frame step request,
-        waits for the emulator frame counter to advance by the requested count,
-        and then waits for the debugger to reach the new stopped state. A
-        non-zero native status is treated as a contract failure.
-        """
         if not self._debugger_initialized:
             raise MesenLoadError("initialize_debugger() must be called before stepping.")
         if count < 1:
             raise ValueError("count must be >= 1")
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be >= 0")
-
         self._bind_fami_pixel_exports()
         status = int(self._dll.FamiPixelStepFrame(count, timeout_ms))
         if status != 0:
