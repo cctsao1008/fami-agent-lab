@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """Witness real SMB frame advancement and raw controller delivery.
 
-This probe avoids two ambiguous signals from earlier M0 experiments:
-
-- IsExecutionStopped()==True can be stale at an already-stopped boundary.
-- SavedJoypadBits ($06FC) is gameplay-specific and is not a valid boot/title
-  screen input witness.
-
-Instead, every requested PPU-frame step must change SMB's FrameCounter ($0009),
-and controller delivery is observed through RawJoypad1Bits ($074A).
+This probe uses the fami-pixel MesenCE fork's synchronous native frame-step
+extension. The native emulator frame counter is the authoritative proof that
+one requested frame actually completed; SMB RAM is sampled only after that
+native transition has completed.
 """
 
 from __future__ import annotations
@@ -23,6 +19,7 @@ from pathlib import Path
 
 from fami_pixel.adapters.mesen import (
     MesenCore,
+    MesenLoadError,
     available_input_overrides,
     configure_standard_nes_controller,
     read_nes_cpu_memory,
@@ -42,7 +39,7 @@ SMB_A = 0x80
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify physical SMB frame advancement plus raw joypad delivery."
+        description="Verify synchronous native frame advancement plus SMB raw joypad delivery."
     )
     parser.add_argument("rom", type=Path, help="Path to a local SMB1 NES ROM")
     parser.add_argument("--dll", type=Path, default=Path("build/mesen/MesenCore.dll"))
@@ -54,16 +51,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def wait_for_frame_counter_change(core: MesenCore, previous: int, timeout: float) -> int | None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        current = read_nes_cpu_memory(core, SMB_FRAME_COUNTER)
-        if current != previous:
-            return current
-        time.sleep(0.0005)
-    return None
-
-
 def run_one_frame(
     core: MesenCore,
     controller: int,
@@ -73,40 +60,37 @@ def run_one_frame(
     frame: int,
     timeout: float,
 ) -> bool:
-    before_counter = read_nes_cpu_memory(core, SMB_FRAME_COUNTER)
-    before_stopped = core.is_execution_stopped()
+    before_native = core.frame_count()
+    before_smb = read_nes_cpu_memory(core, SMB_FRAME_COUNTER)
     set_input_override(core, controller, state)
 
     start = time.perf_counter()
-    core.step_ppu_frame(1)
-    after_counter = wait_for_frame_counter_change(core, before_counter, timeout)
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-
-    if after_counter is None:
-        raw = read_nes_cpu_memory(core, SMB_RAW_JOYPAD1_BITS)
+    try:
+        core.step_frame_sync(1, max(1, int(timeout * 1000)))
+    except MesenLoadError as exc:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
         print(
-            f"Frame {frame:03d}: FAIL action={label:<7} "
-            f"FrameCounter=0x{before_counter:02X}->UNCHANGED "
-            f"RawJoypad=0x{raw:02X} stopped_before={before_stopped} "
-            f"stopped_now={core.is_execution_stopped()} elapsed={elapsed_ms:.3f} ms",
+            f"Frame {frame:03d}: FAIL action={label:<7} native-step={exc} "
+            f"elapsed={elapsed_ms:.3f} ms",
             flush=True,
         )
         return False
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
 
-    # Let the requested step settle at its debugger boundary before sampling the
-    # final raw-input byte. The frame-counter transition itself is the primary
-    # proof that machine time advanced.
-    settle_deadline = time.monotonic() + timeout
-    while time.monotonic() < settle_deadline and not core.is_execution_stopped():
-        time.sleep(0.0005)
-
+    after_native = core.frame_count()
+    after_smb = read_nes_cpu_memory(core, SMB_FRAME_COUNTER)
     raw = read_nes_cpu_memory(core, SMB_RAW_JOYPAD1_BITS)
-    raw_ok = raw == expected_raw
     stopped = core.is_execution_stopped()
-    ok = raw_ok and stopped
+
+    native_delta = (after_native - before_native) & 0xFFFFFFFF
+    native_ok = native_delta == 1
+    raw_ok = raw == expected_raw
+    ok = native_ok and raw_ok and stopped
+
     print(
         f"Frame {frame:03d}: {'PASS' if ok else 'FAIL'} action={label:<7} "
-        f"FrameCounter=0x{before_counter:02X}->0x{after_counter:02X} "
+        f"NativeFrame={before_native}->{after_native} delta={native_delta} "
+        f"SMBFrame=0x{before_smb:02X}->0x{after_smb:02X} "
         f"RawJoypad=0x{raw:02X} expected=0x{expected_raw:02X} "
         f"stopped={stopped} elapsed={elapsed_ms:.3f} ms",
         flush=True,
@@ -134,6 +118,7 @@ def worker(args: argparse.Namespace) -> None:
 
     core.initialize_debugger()
     print("Debugger  : PASS", flush=True)
+    print(f"NativeFrame: {core.frame_count()}", flush=True)
     slots = available_input_overrides(core)
     print("InputSlots: " + " ".join(f"{i}={'yes' if v else 'no'}" for i, v in enumerate(slots)), flush=True)
     if not 0 <= args.controller < 8 or not slots[args.controller]:
@@ -141,7 +126,7 @@ def worker(args: argparse.Namespace) -> None:
         print(FAIL_MARKER, flush=True)
         threading.Event().wait()
     print(f"Controller: PASS (slot {args.controller})", flush=True)
-    print("Witness   : FrameCounter=$0009 RawJoypad1Bits=$074A", flush=True)
+    print("Witness   : native frame count + SMB FrameCounter=$0009 + RawJoypad1Bits=$074A", flush=True)
 
     sequence = [
         (right_state(), "RIGHT", SMB_RIGHT),
@@ -167,7 +152,7 @@ def worker(args: argparse.Namespace) -> None:
         threading.Event().wait()
 
     print(f"FrameWitness: PASS ({passed}/{len(sequence)})", flush=True)
-    print("NativePath  : action -> Mesen -> SMB raw joypad + frame counter -> Python", flush=True)
+    print("NativePath  : action -> synchronous Mesen frame -> SMB RAM -> Python", flush=True)
     print(READY_MARKER, flush=True)
     threading.Event().wait()
 
