@@ -60,8 +60,19 @@ This definition is intentionally local to SMB1. Other games must provide their o
 
 Source audit: complete.
 
-Unit-level contract tests: implemented for `0x08 -> 0x0B` death entry, `0x04 -> 0x05` level-complete entry, and duplicate suppression while a terminal routine remains unchanged.
-
-The preceding non-terminal M1 contract slice was machine-independent and passed locally as `8 passed`. The newly added terminal-event tests still require a fresh local pytest run after pulling these commits.
+Unit-level contract tests: added for `0x08 -> 0x0B` death entry, `0x04 -> 0x05` level-complete entry, and duplicate suppression while a terminal routine remains unchanged.
 
 Machine validation against an actual death and actual 1-1 completion remains required before these terminal events are considered fully machine-validated.
+
+### Death probe attempt 1 — stationary Mario
+
+The first machine probe intentionally left Mario stationary after entering World 1-1. Result:
+
+```text
+GameEntry : PASS NativeFrame=196 X=40 Engine=0x08
+DeathEdge : FAIL no DIED event within 900 frames; Engine=0x08 X=40
+```
+
+This is a useful negative result: standing at the initial X position does not guarantee an enemy activation/collision path. The event definition itself was not disproved; the stimulus failed to produce a death.
+
+The death probe was therefore revised to hold RIGHT with no jump after game entry, forcing normal World 1-1 execution to advance into a collision/death path while logging engine transitions. No RAM state is fabricated for this validation.
