@@ -63,22 +63,45 @@ Write-Host "MSBuild    : $MSBuild"
 Write-Host "Solution   : $Solution"
 Write-Host "Target     : InteropDLL"
 Write-Host "Config     : $Configuration|$Platform"
+Write-Host "Encoding   : UTF-8 (/utf-8)"
 Write-Host
 
 # Build through Mesen.sln rather than invoking InteropDLL.vcxproj directly.
 # Several Mesen projects derive their include paths and output directories from
 # $(SolutionDir); direct project invocation leaves that property without the
 # solution context and causes includes such as Utilities/... and Core/... to fail.
-& $MSBuild $Solution `
-    /m `
-    /nologo `
-    /verbosity:minimal `
-    /t:InteropDLL `
-    "/p:Configuration=$Configuration" `
-    "/p:Platform=$Platform"
+#
+# Mesen source contains Unicode text. On Windows systems whose active ANSI code
+# page is not UTF-8 (for example Traditional Chinese CP950), MSVC emits C4819.
+# Mesen treats warnings as errors, which promotes that warning to C2220 and
+# stops the build. Inject /utf-8 through the documented CL environment variable
+# for this child build only, without modifying the upstream submodule.
+$OriginalCL = [Environment]::GetEnvironmentVariable("CL", "Process")
+try {
+    $env:CL = if ([string]::IsNullOrWhiteSpace($OriginalCL)) {
+        "/utf-8"
+    } else {
+        "/utf-8 $OriginalCL"
+    }
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Mesen InteropDLL build failed with exit code $LASTEXITCODE."
+    & $MSBuild $Solution `
+        /m `
+        /nologo `
+        /verbosity:minimal `
+        /t:InteropDLL `
+        "/p:Configuration=$Configuration" `
+        "/p:Platform=$Platform"
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Mesen InteropDLL build failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    if ($null -eq $OriginalCL) {
+        Remove-Item Env:CL -ErrorAction SilentlyContinue
+    } else {
+        $env:CL = $OriginalCL
+    }
 }
 
 if (-not (Test-Path $SourceDll)) {
