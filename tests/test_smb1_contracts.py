@@ -1,6 +1,6 @@
 import pytest
 
-from fami_pixel.adapters.mesen import NES_A, NES_LEFT, NES_RIGHT
+from fami_pixel.adapters.mesen import NES_A, NES_B, NES_LEFT, NES_RIGHT
 from fami_pixel.games.smb1 import (
     ActionCommand,
     GameEventType,
@@ -31,14 +31,7 @@ def _state() -> Smb1State:
     )
 
 
-def _observation(
-    frame_id: int,
-    *,
-    x: int,
-    state: int,
-    y: int = 0xB0,
-    engine: int = 0x08,
-):
+def _observation(frame_id: int, *, x: int, state: int, y: int = 0xB0, engine: int = 0x08):
     source = _state()
     source = Smb1State(
         frame_counter=source.frame_counter,
@@ -61,17 +54,22 @@ def _observation(
 
 def test_action_mapping_matches_native_nes_bytes() -> None:
     assert action_to_nes_buttons(Smb1Action.NOOP) == 0x00
+    assert action_to_nes_buttons(Smb1Action.A) == NES_A
+    assert action_to_nes_buttons(Smb1Action.B) == NES_B
     assert action_to_nes_buttons(Smb1Action.RIGHT) == NES_RIGHT
     assert action_to_nes_buttons(Smb1Action.RIGHT_A) == (NES_RIGHT | NES_A)
+    assert action_to_nes_buttons(Smb1Action.RIGHT_B) == (NES_RIGHT | NES_B)
+    assert action_to_nes_buttons(Smb1Action.RIGHT_A_B) == (NES_RIGHT | NES_A | NES_B)
     assert action_to_nes_buttons(Smb1Action.LEFT) == NES_LEFT
     assert action_to_nes_buttons(Smb1Action.LEFT_A) == (NES_LEFT | NES_A)
-    assert action_to_nes_buttons(Smb1Action.A) == NES_A
+    assert action_to_nes_buttons(Smb1Action.LEFT_B) == (NES_LEFT | NES_B)
+    assert action_to_nes_buttons(Smb1Action.LEFT_A_B) == (NES_LEFT | NES_A | NES_B)
 
 
 def test_action_command_is_frame_explicit() -> None:
-    command = ActionCommand(Smb1Action.RIGHT_A, 10)
+    command = ActionCommand(Smb1Action.RIGHT_A_B, 10)
     assert command.frame_count == 10
-    assert command.nes_buttons == (NES_RIGHT | NES_A)
+    assert command.nes_buttons == (NES_RIGHT | NES_A | NES_B)
 
 
 def test_action_command_rejects_nonpositive_duration() -> None:
