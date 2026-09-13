@@ -1,0 +1,3 @@
+[submodule "modules/mesen"]
+	path = modules/mesen
+	url = https://github.com/nesdev-org/MesenCE.git
