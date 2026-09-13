@@ -4,50 +4,27 @@ This document records the durable technical findings for the initial direct Pyth
 
 ## Verified upstream ABI surface
 
-The pinned Mesen CE `InteropDLL` exposes a set of simple functions whose signatures can be bound safely without guessing native struct layouts:
+The current Mesen CE `InteropDLL` exports a small set of simple functions that can be bound safely without guessing native struct layouts:
 
 ```text
 TestDll()
 GetMesenVersion()
 GetMesenBuildDate()
-InitDll()
-InitializeEmu(...)
-LoadRom(...)
-IsRunning()
-Pause()
-Resume()
-IsPaused()
-Stop()
-Release()
 ```
 
-The exact pinned upstream signatures used by the first headless lifecycle are:
+The M0 probe binds only verified signatures and uses symbol discovery for the remaining M0-relevant exports.
 
-```cpp
-void __stdcall InitDll();
-
-void __stdcall InitializeEmu(
-    const char* homeFolder,
-    void* windowHandle,
-    void* viewerHandle,
-    bool softwareRenderer,
-    bool noAudio,
-    bool noVideo,
-    bool noInput
-);
-
-bool __stdcall LoadRom(char* filename, char* patchFile);
-bool __stdcall IsRunning();
-bool __stdcall IsPaused();
-void __stdcall Stop();
-void __stdcall Release();
-```
-
-For headless M0 bring-up, both native window handles are null and audio, video, and host input are disabled.
-
-The remaining M0-relevant exports are still discovered by name before any deeper binding work:
+The following exports are expected from the upstream interop surface and are checked by name before any deeper binding work:
 
 ```text
+InitDll
+InitializeEmu
+LoadRom
+Pause
+Resume
+IsPaused
+Stop
+Release
 InitializeDebugger
 ReleaseDebugger
 IsDebuggerRunning
@@ -76,29 +53,32 @@ This avoids creating an ABI that merely appears to work on one build.
 
 ## Project-controlled Mesen build
 
-Mesen CE is pinned as the `modules/mesen` Git submodule. The native DLL is produced by the upstream `InteropDLL` project, but fami-pixel intentionally builds that target through:
+Mesen CE is pinned as the `modules/mesen` Git submodule. The pinned upstream project that produces the native DLL is:
 
 ```text
-modules/mesen/Mesen.sln
+modules/mesen/InteropDLL/InteropDLL.vcxproj
 ```
 
-rather than invoking `InteropDLL.vcxproj` directly. Several upstream projects derive include paths from `$(SolutionDir)`, so direct project invocation breaks dependency include resolution.
+For `Release|x64`, the upstream project explicitly defines:
 
-For `Release|x64`, the upstream output is:
+```text
+TargetName = MesenCore
+OutDir     = <Mesen solution>/bin/win-x64/Release/
+```
+
+Therefore the expected upstream build artifact is:
 
 ```text
 modules/mesen/bin/win-x64/Release/MesenCore.dll
 ```
 
-`tools/build_mesen.ps1` performs a clean solution-target build, stages the result at:
+`tools/build_mesen.ps1` builds the `InteropDLL` target through `Mesen.sln`, stages the result at:
 
 ```text
 build/mesen/MesenCore.dll
 ```
 
 and runs the M0 ABI probe unless `-SkipProbe` is specified.
-
-On Traditional-Chinese Windows hosts, the pinned upstream source includes text that triggers MSVC `C4819` under the local code page. The build wrapper preserves the upstream/default source encoding and suppresses only warning `C4819`; it does not force the whole tree to UTF-8 because some pinned source files contain legacy/non-UTF-8 bytes.
 
 On a fresh clone:
 
@@ -109,57 +89,80 @@ git submodule update --init --recursive
 
 The script requires Visual Studio 2022/2026 with the C++ desktop toolchain and locates `MSBuild.exe` through PATH or `vswhere.exe`.
 
-## ABI probe
+On Traditional Chinese Windows, the pinned Mesen source contains legacy/non-UTF-8 text that triggers MSVC encoding warnings. The build wrapper preserves the upstream/default source encoding and suppresses only warning `C4819`; forcing the entire tree to `/utf-8` is not valid for this pinned revision.
 
-Install the package in editable mode, then run on Windows:
+## Verified headless boot path
 
-```powershell
-py -m pip install -e .
-py tools\inspect_mesen_exports.py build\mesen\MesenCore.dll
-```
-
-The probe reports the DLL path, `TestDll()` result, Mesen numeric version, native build date, and presence/absence of each M0-relevant export.
-
-The project-controlled build has been verified to produce a loadable `MesenCore.dll` whose M0 export probe passes.
-
-## Headless ROM boot smoke test
-
-The next M0 slice validates only the native emulator lifecycle before debugger stepping or controller injection:
+The following exact upstream signatures are bound and exercised:
 
 ```text
 InitDll
-→ InitializeEmu(headless)
+InitializeEmu
+LoadRom
+IsRunning
+IsPaused
+Pause
+Resume
+Stop
+Release
+```
+
+The current headless path is:
+
+```text
+InitDll
+→ InitializeEmu(noAudio=true, noVideo=true, noInput=true)
 → LoadRom(local ROM)
 → IsRunning / IsPaused
 → Stop
 → Release
 ```
 
-Run it with a local ROM path:
+`examples/mesen_headless_boot.py` validates this path against a user-supplied local ROM. ROMs remain local and are not stored in this repository.
 
-```powershell
-py examples\mesen_headless_boot.py "D:\path\to\game.nes"
-```
+## Verified debugger lifecycle
 
-The default DLL and isolated Mesen home paths are:
+The pinned Mesen CE source defines and the adapter now binds:
 
 ```text
-build/mesen/MesenCore.dll
-build/mesen-home/
+InitializeDebugger()
+ReleaseDebugger()
+IsDebuggerRunning() -> bool
+IsExecutionStopped() -> bool
+ResumeExecution()
 ```
 
-ROM images remain local and are not committed to fami-pixel.
+`examples/mesen_debugger_smoke.py` exercises debugger initialization and release after a successful headless ROM load. It intentionally does not issue `Step()` yet.
 
-## Next ABI audit
+The enum audit needed for the next slice is now partially complete:
 
-After the headless ROM boot is confirmed on the target machine, continue in this order:
+```text
+CpuType : uint8_t
+CpuType::Nes = 8
 
-1. debugger lifecycle;
-2. exact `CpuType` and `StepType` declarations;
-3. deterministic frame-step semantics;
-4. exact controller override layout;
-5. one structured memory observation path;
-6. native framebuffer ownership and export path.
+StepType:
+  Step             = 0
+  StepOut          = 1
+  StepOver         = 2
+  CpuCycleStep     = 3
+  PpuStep          = 4
+  PpuScanline      = 5
+  PpuFrame         = 6
+  SpecificScanline = 7
+  RunToNmi         = 8
+  RunToIrq         = 9
+  StepBack         = 10
+```
+
+Upstream `Step` is exported as:
+
+```cpp
+void __stdcall Step(CpuType cpuType, uint32_t count, StepType type)
+```
+
+The next machine-facing task is to validate debugger lifecycle first, then bind `Step` using the verified enum widths/values and determine its completion semantics for deterministic one-frame stepping.
+
+## Target M0 control trace
 
 The target remains a frame-aligned sequence:
 
