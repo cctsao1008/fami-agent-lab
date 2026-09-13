@@ -3,11 +3,11 @@
 
 V7 turns the official SMB1 control semantics into the planner action model:
 horizontal intent, A hold, B/run state, and short frame-explicit durations are
-independent control dimensions.  It also folds regression replay into the same
+independent control dimensions. It also folds regression replay into the same
 entry point so a captured V5/V6 report ZIP can be tested without manually
 extracting or renaming save states.
 
-Mesen remains machine authority.  Candidate rollouts are counterfactual and only
+Mesen remains machine authority. Candidate rollouts are counterfactual and only
 the first selected root command is committed to the authoritative episode.
 """
 
@@ -91,8 +91,6 @@ ACTION_LABELS = {
 for candidate in PRECISION_CANDIDATES:
     ACTION_LABELS[candidate.name] = candidate.name.replace("_a_b_", "+A+B ").replace("_a_", "+A ").replace("_b_", "+B ").replace("_", " ") + "f"
 
-# Reuse V6's already-audited rollout/capture/beam machinery, but teach its
-# presentation layer the V7 labels so deeper beam paths remain readable.
 v6.ACTION_LABELS.update(ACTION_LABELS)
 
 FIXTURE_X = {
@@ -117,8 +115,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--precision-width", type=int, default=10)
     p.add_argument("--audit-interval", type=int, default=4)
     p.add_argument("--target-x", type=int, default=None)
-    p.add_argument("--report-zip", type=Path, default=None, help="optional prior test-report ZIP for direct regression replay")
-    p.add_argument("--fixture", choices=tuple(FIXTURE_X), default=None, help="fixture inside --report-zip")
+    p.add_argument("--report-zip", type=Path, default=None, help="optional prior V5/V6 test-report ZIP; if omitted with --fixture, the newest local report is auto-discovered")
+    p.add_argument("--fixture", choices=tuple(FIXTURE_X), default=None, help="fixture to replay from a prior report ZIP")
     return p.parse_args()
 
 
@@ -144,10 +142,60 @@ def load_state(core: MesenCore, path: Path):
     raise RuntimeError(f"save-state load did not become visible: {source}")
 
 
+def _report_candidates() -> list[Path]:
+    roots = [Path.cwd(), Path("build/test-reports")]
+    patterns = ("fami-pixel-v6-test-report-*.zip", "fami-pixel-v5-test-report-*.zip")
+    found: dict[Path, float] = {}
+    for root in roots:
+        root = root.expanduser().resolve()
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            for path in root.rglob(pattern):
+                try:
+                    found[path.resolve()] = path.stat().st_mtime
+                except OSError:
+                    pass
+    return [p for p, _ in sorted(found.items(), key=lambda item: item[1], reverse=True)]
+
+
+def resolve_report_zip(requested: Path | None) -> Path:
+    if requested is not None:
+        direct = requested.expanduser()
+        try:
+            resolved = direct.resolve()
+        except OSError:
+            resolved = direct.absolute()
+        if resolved.is_file():
+            return resolved
+
+        # If the caller supplied a display/example path (for example D:\...\file.zip),
+        # recover by basename before falling back to the newest report.
+        basename = direct.name
+        if basename and basename not in {".", ".."}:
+            for candidate in _report_candidates():
+                if candidate.name == basename:
+                    print(f"Report ZIP : requested path missing; found by filename -> {candidate}", flush=True)
+                    return candidate
+
+    candidates = _report_candidates()
+    if candidates:
+        chosen = candidates[0]
+        if requested is None:
+            print(f"Report ZIP : auto-discovered newest prior report -> {chosen}", flush=True)
+        else:
+            print(f"Report ZIP : requested path missing; using newest prior report -> {chosen}", flush=True)
+        return chosen
+
+    if requested is None:
+        raise FileNotFoundError(
+            "no prior V5/V6 test-report ZIP found; expected one under build/test-reports or the current tree"
+        )
+    raise FileNotFoundError(f"report ZIP not found: {requested.expanduser()}")
+
+
 def resolve_fixture(report_zip: Path, fixture: str) -> tuple[Path, Path]:
     archive = report_zip.expanduser().resolve()
-    if not archive.is_file():
-        raise FileNotFoundError(f"report ZIP not found: {archive}")
     target_x = FIXTURE_X[fixture]
     temp_root = Path(tempfile.mkdtemp(prefix="fami-pixel-v7-fixture-"))
     with zipfile.ZipFile(archive, "r") as zf:
@@ -170,8 +218,8 @@ def finish_success(core: MesenCore, current, episode: EpisodeAccumulator, timeou
 
 def main() -> int:
     args = parse_args()
-    if (args.report_zip is None) != (args.fixture is None):
-        raise ValueError("--report-zip and --fixture must be supplied together")
+    if args.report_zip is not None and args.fixture is None:
+        raise ValueError("--report-zip requires --fixture")
 
     core = MesenCore(args.dll)
     print(f"DLL       : {core.path}", flush=True)
@@ -188,10 +236,12 @@ def main() -> int:
     print("Debugger  : PASS", flush=True)
 
     fixture_temp: Path | None = None
-    if args.report_zip is not None:
-        fixture_path, fixture_temp = resolve_fixture(args.report_zip, args.fixture)
+    if args.fixture is not None:
+        report_zip = resolve_report_zip(args.report_zip)
+        fixture_path, fixture_temp = resolve_fixture(report_zip, args.fixture)
         current = load_state(core, fixture_path)
         print(f"Fixture   : {args.fixture} -> {fixture_path.name}", flush=True)
+        print(f"Source ZIP: {report_zip}", flush=True)
         print(f"StateLoad : PASS | {v6.motion_summary(current)} | frame={current.native_frame_id}", flush=True)
     else:
         gameplay = enter_world_1_1(core, args.step_timeout)
