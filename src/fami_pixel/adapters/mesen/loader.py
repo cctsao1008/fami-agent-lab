@@ -1,8 +1,8 @@
 """Minimal, non-speculative loader for the Mesen CE interop DLL.
 
 This module binds only ABI entries whose signatures have been verified in the
-pinned Mesen CE source. Struct- and enum-heavy exports remain discovery-only
-until their exact native layouts are audited.
+pinned Mesen CE source. Struct-heavy exports remain discovery-only until their
+exact native layouts are audited.
 """
 
 from __future__ import annotations
@@ -15,6 +15,11 @@ from typing import Iterable
 
 class MesenLoadError(RuntimeError):
     """Raised when MesenCore.dll cannot be loaded or a verified call fails."""
+
+
+# Verified enum values from the pinned Mesen CE source.
+CPU_TYPE_NES = 8
+STEP_TYPE_PPU_FRAME = 6
 
 
 # Exports relevant to M0. Presence can be checked without guessing struct layouts.
@@ -64,7 +69,6 @@ class MesenCore:
             raise MesenLoadError(f"MesenCore.dll not found: {self.path}")
 
         try:
-            # Keep dependent-DLL lookup local to the Mesen build directory.
             self._dll_directory = os.add_dll_directory(str(self.path.parent))
             self._dll = ctypes.WinDLL(str(self.path))
         except (OSError, AttributeError) as exc:
@@ -134,6 +138,11 @@ class MesenCore:
             self._dll.ResumeExecution.argtypes = []
             self._dll.ResumeExecution.restype = None
 
+            # CpuType is uint8_t in pinned source. StepType uses the default int
+            # enum representation. The exported count is uint32_t.
+            self._dll.Step.argtypes = [ctypes.c_uint8, ctypes.c_uint32, ctypes.c_int]
+            self._dll.Step.restype = None
+
             self._dll.Release.argtypes = []
             self._dll.Release.restype = None
         except AttributeError as exc:
@@ -147,22 +156,18 @@ class MesenCore:
         return os.fsencode(str(path))
 
     def smoke_test(self) -> bool:
-        """Call upstream TestDll(); no emulator initialization is performed."""
         return bool(self._dll.TestDll())
 
     def version(self) -> int:
-        """Return Mesen's numeric version from GetMesenVersion()."""
         return int(self._dll.GetMesenVersion())
 
     def build_date(self) -> str:
-        """Return the native build date string exported by Mesen CE."""
         value = self._dll.GetMesenBuildDate()
         if value is None:
             return ""
         return value.decode("utf-8", errors="replace")
 
     def initialize_headless(self, home_folder: str | os.PathLike[str]) -> None:
-        """Initialize Mesen without renderer, audio, or host input devices."""
         if self._released:
             raise MesenLoadError("MesenCore instance has already been released.")
         if self._initialized:
@@ -176,15 +181,14 @@ class MesenCore:
             self._native_path(home),
             None,
             None,
-            True,   # softwareRenderer; inert without viewer/window handles
-            True,   # noAudio
-            True,   # noVideo
-            True,   # noInput
+            True,
+            True,
+            True,
+            True,
         )
         self._initialized = True
 
     def load_rom(self, rom_path: str | os.PathLike[str]) -> bool:
-        """Load a local ROM through Mesen's verified LoadRom export."""
         if not self._initialized:
             raise MesenLoadError("initialize_headless() must be called before load_rom().")
 
@@ -207,7 +211,6 @@ class MesenCore:
         self._dll.Resume()
 
     def initialize_debugger(self) -> None:
-        """Initialize Mesen's debugger after the emulator/ROM are live."""
         if not self._initialized:
             raise MesenLoadError(
                 "initialize_headless() must be called before initialize_debugger()."
@@ -221,12 +224,6 @@ class MesenCore:
         self._debugger_initialized = True
 
     def release_debugger(self) -> None:
-        """Release Mesen's debugger explicitly.
-
-        M0 teardown should normally call stop() while the debugger is still
-        attached and let Mesen tear debugger state down as part of Stop().
-        This direct wrapper is retained for later controlled lifecycle tests.
-        """
         if self._debugger_initialized and not self._released:
             self._dll.ReleaseDebugger()
             self._debugger_initialized = False
@@ -240,20 +237,25 @@ class MesenCore:
     def resume_execution(self) -> None:
         self._dll.ResumeExecution()
 
+    def step_ppu_frame(self, count: int = 1) -> None:
+        """Request one or more NES PPU-frame debugger steps.
+
+        Upstream DebugBreakHelper handles break/resume around this host-thread
+        call, so callers should not inject ResumeExecution() between ordinary
+        frame-step requests.
+        """
+        if not self._debugger_initialized:
+            raise MesenLoadError("initialize_debugger() must be called before stepping.")
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        self._dll.Step(CPU_TYPE_NES, count, STEP_TYPE_PPU_FRAME)
+
     def stop(self) -> None:
-        """Stop emulation; Mesen also resets active debugger state here."""
         if self._initialized and not self._released:
             self._dll.Stop()
             self._debugger_initialized = False
 
     def release(self) -> None:
-        """Release the native emulator exactly once.
-
-        Do not pre-release the debugger here. Upstream Emulator::Release() calls
-        Stop(true), and Stop() owns debugger reset/teardown. Releasing the
-        debugger first while the emulation thread is live can leave Stop()
-        waiting on that thread during teardown.
-        """
         if self._released:
             return
         if self._initialized:
@@ -268,7 +270,6 @@ class MesenCore:
         self.release()
 
     def has_export(self, name: str) -> bool:
-        """Return whether the loaded DLL exports *name*."""
         try:
             getattr(self._dll, name)
         except AttributeError:
@@ -276,5 +277,4 @@ class MesenCore:
         return True
 
     def available_exports(self, names: Iterable[str] = M0_EXPORTS) -> dict[str, bool]:
-        """Probe a set of export names without binding uncertain ABI signatures."""
         return {name: self.has_export(name) for name in names}
