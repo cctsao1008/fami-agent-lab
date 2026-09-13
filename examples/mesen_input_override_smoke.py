@@ -18,6 +18,7 @@ from pathlib import Path
 from fami_pixel.adapters.mesen import (
     MesenCore,
     available_input_overrides,
+    configure_standard_nes_controller,
     released_state,
     right_state,
     set_input_override,
@@ -78,6 +79,13 @@ def worker(args: argparse.Namespace) -> None:
 
     core.initialize_headless(args.home)
     print("Init      : PASS", flush=True)
+
+    config = configure_standard_nes_controller(core, port=1)
+    print(
+        f"NesConfig : PASS (sizeof={type(config).__sizeof__(config)} Port1.Type={config.Port1.Type} AutoConfigureInput={bool(config.AutoConfigureInput)})",
+        flush=True,
+    )
+
     if not core.load_rom(args.rom):
         print("LoadRom   : FAIL", flush=True)
         raise SystemExit(1)
@@ -96,8 +104,6 @@ def worker(args: argparse.Namespace) -> None:
     frame = 1
     frame = step_action(core, args.controller, right_state(), "RIGHT", frame, 60, args.step_timeout) + 1
     frame = step_action(core, args.controller, right_state(jump=True), "RIGHT+A", frame, 10, args.step_timeout) + 1
-    # Zero state removes the debugger's forced buttons; because headless init uses
-    # noInput=true, the underlying host input state is neutral.
     frame = step_action(core, args.controller, released_state(), "RELEASE", frame, 2, args.step_timeout) + 1
 
     print(f"ControlTrace: PASS ({frame - 1} frame-aligned commands)", flush=True)
