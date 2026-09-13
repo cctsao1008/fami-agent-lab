@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Add sports-style narration, binary capture, and test-report packaging to V5.
+"""Add sports-style narration and test-report packaging to V5 planner output.
 
-This is a presentation/capture layer only. It does not change planner decisions,
-emulator state, checkpoint scoring, or episode semantics. The underlying V5
-output is passed through verbatim while short narrative lines are inserted. At
-each real decision boundary, the authoritative V5 root save-state is copied to a
-stable capture directory. Before exit, the run is packaged automatically into a
-shareable ZIP containing the raw planner log, checkpoint index, and binary states.
+Binary checkpoint capture is owned by the V5 worker itself so snapshots are
+atomic with the machine state they describe. This wrapper only narrates the
+planner output, records the raw planner stream, and packages the worker-produced
+capture directory into a shareable ZIP before exit.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ COMMITTED_RE = re.compile(
     r"vertical_speed=([+-]?\d+), engine=(0x[0-9A-Fa-f]+)"
 )
 
-DEFAULT_STATE_FILE = Path("build/checkpoints/smb1-planner-v5.mss")
 DEFAULT_CAPTURE_DIR = Path("build/checkpoints/v5-cast-captures")
 DEFAULT_REPORT_DIR = Path("build/test-reports")
 
@@ -99,35 +96,8 @@ def strip_wrapper_option(argv: list[str], name: str) -> list[str]:
     return result
 
 
-def initialize_capture_dir(capture_dir: Path) -> Path:
-    capture_dir = capture_dir.expanduser().resolve()
-    if capture_dir.exists():
-        shutil.rmtree(capture_dir)
-    capture_dir.mkdir(parents=True, exist_ok=True)
-    (capture_dir / "index.tsv").write_text(
-        "decision\tframe\tmario_x\tcheckpoint\n",
-        encoding="utf-8",
-    )
-    return capture_dir
-
-
-def capture_checkpoint(
-    state_file: Path,
-    capture_dir: Path,
-    decision: int,
-    frame: int,
-    mario_x: int,
-) -> Path | None:
-    source = state_file.expanduser().resolve()
-    if not source.is_file() or source.stat().st_size <= 0:
-        return None
-    destination = capture_dir / (
-        f"decision-{decision:03d}-frame-{frame:06d}-X-{mario_x:04d}.mss"
-    )
-    shutil.copy2(source, destination)
-    with (capture_dir / "index.tsv").open("a", encoding="utf-8", newline="") as index_file:
-        index_file.write(f"{decision}\t{frame}\t{mario_x}\t{destination.name}\n")
-    return destination
+def has_option(argv: list[str], name: str) -> bool:
+    return any(arg == name or arg.startswith(name + "=") for arg in argv)
 
 
 def build_test_report_zip(
@@ -135,26 +105,45 @@ def build_test_report_zip(
     report_dir: Path,
     command: list[str],
     exit_code: int,
+    raw_log_path: Path,
 ) -> Path:
     report_dir = report_dir.expanduser().resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
+    capture_dir = capture_dir.expanduser().resolve()
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
+    if raw_log_path.is_file():
+        shutil.copy2(raw_log_path, capture_dir / "planner.log")
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     report_name = f"fami-pixel-v5-test-report-{timestamp}"
     snapshots = sorted(capture_dir.glob("*.mss"))
+    authoritative = sorted(capture_dir.glob("*-authoritative-*.mss"))
+    root_candidates = sorted(capture_dir.glob("*-root-*.mss"))
     report_text = [
         "Fami Pixel V5 Test Report",
         "========================",
         f"created_local: {datetime.now().astimezone().isoformat(timespec='seconds')}",
         f"exit_code: {exit_code}",
         f"snapshot_count: {len(snapshots)}",
+        f"authoritative_snapshot_count: {len(authoritative)}",
+        f"root_candidate_snapshot_count: {len(root_candidates)}",
         f"capture_directory: {capture_dir}",
+        "capture_authority: snapshots were produced synchronously inside the V5 worker",
         "command:",
         "  " + subprocess.list2cmdline(command),
         "",
         "Contents:",
         "  planner.log  - complete raw V5 planner stdout/stderr",
-        "  index.tsv    - decision/frame/X to .mss mapping",
-        "  *.mss        - authoritative decision-boundary Mesen save states",
+        "  index.tsv    - kind/decision/action/frame/X/size/SHA-256 to .mss mapping",
+        "  *-authoritative-*.mss - real decision-boundary Mesen state",
+        "  *-root-*.mss          - immediate counterfactual root-candidate endpoint",
+        "",
+        "Important:",
+        "  authoritative snapshots belong to the committed episode timeline.",
+        "  root-candidate snapshots are counterfactual planning evidence only.",
+        "  SHA-256 values in index.tsv can be used to test whether apparently",
+        "  identical observed states are also identical full Mesen save states.",
         "",
     ]
     (capture_dir / "report.txt").write_text("\n".join(report_text), encoding="utf-8")
@@ -171,14 +160,18 @@ def build_test_report_zip(
 def main() -> int:
     planner = Path(__file__).with_name("mesen_smb_checkpoint_planner_v5.py")
     raw_args = sys.argv[1:]
-    state_file = extract_option(raw_args, "--state-file", DEFAULT_STATE_FILE)
-    capture_dir = initialize_capture_dir(
-        extract_option(raw_args, "--capture-dir", DEFAULT_CAPTURE_DIR)
-    )
-    report_dir = extract_option(raw_args, "--report-dir", DEFAULT_REPORT_DIR)
-    planner_args = strip_wrapper_option(raw_args, "--capture-dir")
-    planner_args = strip_wrapper_option(planner_args, "--report-dir")
+    capture_dir = extract_option(raw_args, "--capture-dir", DEFAULT_CAPTURE_DIR).expanduser().resolve()
+    report_dir = extract_option(raw_args, "--report-dir", DEFAULT_REPORT_DIR).expanduser().resolve()
+
+    planner_args = strip_wrapper_option(raw_args, "--report-dir")
+    if not has_option(planner_args, "--capture-dir"):
+        planner_args.extend(["--capture-dir", str(capture_dir)])
     command = [sys.executable, str(planner), *planner_args]
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    raw_log_path = report_dir / ".fami-pixel-v5-planner-running.log"
+    if raw_log_path.exists():
+        raw_log_path.unlink()
 
     process = subprocess.Popen(
         command,
@@ -190,17 +183,15 @@ def main() -> int:
     assert process.stdout is not None
 
     decision_start_x: int | None = None
-    current_decision: int | None = None
     beam_pick_pending = False
-    planner_log_path = capture_dir / "planner.log"
 
     print("\n=== Fami Pixel Sportscast ===", flush=True)
     print("The planner is driving; this narrator only describes what the machine actually reports.", flush=True)
-    print(f"Binary capture : ON -> {capture_dir}", flush=True)
-    print("Capture policy : one authoritative .mss snapshot at every real decision boundary", flush=True)
-    print(f"Test report ZIP: automatic -> {report_dir.expanduser().resolve()}\n", flush=True)
+    print(f"Binary capture : worker-owned -> {capture_dir}", flush=True)
+    print("Capture policy : authoritative decision state + four immediate candidate endpoints", flush=True)
+    print(f"Test report ZIP: automatic -> {report_dir}\n", flush=True)
 
-    with planner_log_path.open("w", encoding="utf-8", newline="") as planner_log:
+    with raw_log_path.open("w", encoding="utf-8", newline="") as planner_log:
         for line in process.stdout:
             print(line, end="")
             planner_log.write(line)
@@ -209,27 +200,18 @@ def main() -> int:
 
             match = DECISION_RE.search(stripped)
             if match:
-                current_decision = int(match.group(1))
+                decision = int(match.group(1))
                 frame = int(match.group(2))
                 decision_start_x = int(match.group(3))
-                captured = capture_checkpoint(
-                    state_file, capture_dir, current_decision, frame, decision_start_x
-                )
                 print(
-                    f"PLAY-BY-PLAY : Decision {current_decision}. Mario sets up at X={decision_start_x} "
+                    f"PLAY-BY-PLAY : Decision {decision}. Mario sets up at X={decision_start_x} "
                     f"on frame {frame}. The planner is reading the field.",
                     flush=True,
                 )
-                if captured is not None:
-                    print(
-                        f"BINARY SNAPSHOT: saved {captured.name} ({captured.stat().st_size} bytes)",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"BINARY SNAPSHOT: WARNING - checkpoint not available at {state_file}",
-                        flush=True,
-                    )
+                continue
+
+            if stripped.startswith("Binary capture : authoritative decision"):
+                print("DATA BOOTH    : Machine state locked in before the planner explores alternatives.", flush=True)
                 continue
 
             if stripped.startswith("Safety audit:"):
@@ -287,17 +269,26 @@ def main() -> int:
 
     code = process.wait()
     try:
-        report_zip = build_test_report_zip(capture_dir, report_dir, command, code)
+        report_zip = build_test_report_zip(
+            capture_dir,
+            report_dir,
+            command,
+            code,
+            raw_log_path,
+        )
         print("\n=== TEST REPORT READY ===", flush=True)
-        print(f"Raw planner log : {planner_log_path}", flush=True)
+        print(f"Raw planner log : {capture_dir / 'planner.log'}", flush=True)
         print(f"Binary snapshots: {capture_dir}", flush=True)
         print(f"Report ZIP      : {report_zip}", flush=True)
         print(
-            "Share the ZIP as-is; it contains the raw log, index, report metadata, and all captured .mss states.",
+            "Share the ZIP as-is; binary captures now come from the planner worker, not from stdout timing.",
             flush=True,
         )
     except Exception as exc:
         print(f"\nTEST REPORT WARNING: failed to create ZIP: {exc}", flush=True)
+    finally:
+        if raw_log_path.exists():
+            raw_log_path.unlink()
 
     return code
 
