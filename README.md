@@ -69,29 +69,6 @@ reset
 
 For each step, record the frame identifier, action, native visual observation, and selected structured state.
 
-## Project layout
-
-```text
-fami-agent-lab/
-├─ README.md
-├─ docs/
-│  ├─ architecture.md
-│  └─ mesen-interop.md
-├─ fami_agent/
-│  ├─ __init__.py
-│  ├─ env.py
-│  ├─ mesen.py
-│  ├─ observation.py
-│  ├─ input.py
-│  └─ mario/
-│     ├─ __init__.py
-│     └─ state.py
-├─ experiments/
-│  └─ smb1/
-├─ tests/
-└─ tools/
-```
-
 ## Design rule
 
 Keep the emulator as the source of truth for machine state, keep Python as the experimentation layer, and keep game-specific semantics isolated from the generic NES environment.
