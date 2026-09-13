@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """State-diverse beam checkpoint planner for SMB1 World 1-1.
 
-V5 addresses the state-aliasing exposed by V4.  Equal X progress is not treated
+V5 addresses the state-aliasing exposed by V4. Equal X progress is not treated
 as an equal future state: beam nodes retain Mario motion state (Y, player state,
 X/Y speed and engine routine) and several distinct checkpoint branches are kept
 alive across a bounded multi-decision audit.
 
 Only the first 30-frame root candidate selected by the audit is committed to the
-real episode.  Every deeper branch remains counterfactual planning evidence.
+real episode. Every deeper branch remains counterfactual planning evidence.
 """
 
 from __future__ import annotations
@@ -52,6 +52,21 @@ from mesen_smb_checkpoint_planner import (
     save_checkpoint,
 )
 from mesen_smb_checkpoint_planner_v3 import should_audit
+
+
+ACTION_LABELS = {
+    "cruise": "RIGHT only (30 frames)",
+    "tap_jump": "short jump (A 6f + RIGHT 24f)",
+    "medium_jump": "medium jump (A 14f + RIGHT 16f)",
+    "long_jump": "long jump (A 24f + RIGHT 6f)",
+}
+
+AUDIT_REASON_LABELS = {
+    "periodic-safety-audit": "scheduled safety check",
+    "tied-degraded": "several choices are tied and progress is worse than normal",
+    "no-progress": "no candidate makes forward progress",
+    "fast-loop": "normal fast control",
+}
 
 
 @dataclass(frozen=True)
@@ -112,6 +127,45 @@ def fail(message: str) -> None:
     threading.Event().wait()
 
 
+def signed_byte(value: int) -> int:
+    """Display SMB motion bytes as signed 8-bit values for readable logs."""
+    return value - 256 if value >= 128 else value
+
+
+def action_label(name: str) -> str:
+    return ACTION_LABELS.get(name, name)
+
+
+def terminal_label(terminal: CandidateTerminal) -> str:
+    if terminal == CandidateTerminal.DEATH:
+        return "DEATH"
+    if terminal == CandidateTerminal.LEVEL_COMPLETE:
+        return "LEVEL COMPLETE"
+    return "SAFE"
+
+
+def outcome_summary(outcome: CandidateOutcome) -> str:
+    flagpole = "yes" if outcome.reached_flagpole else "no"
+    return (
+        f"progress={outcome.progress:+d}, score={score_candidate(outcome):.3f}, "
+        f"status={terminal_label(outcome.terminal)}, flagpole={flagpole}"
+    )
+
+
+def motion_summary(observation) -> str:
+    return (
+        f"X={observation.mario_x_abs}, Y={observation.mario_y}, "
+        f"player_state={observation.player_state}, "
+        f"horizontal_speed={signed_byte(observation.player_x_speed):+d}, "
+        f"vertical_speed={signed_byte(observation.player_y_speed):+d}, "
+        f"engine=0x{observation.game_engine_subroutine:02X}"
+    )
+
+
+def path_summary(trace: tuple[str, ...]) -> str:
+    return " -> ".join(action_label(name) for name in trace)
+
+
 def evaluate_local_candidates(
     core: MesenCore,
     checkpoint_path: Path,
@@ -145,12 +199,7 @@ def node_score(node: BeamNode) -> float:
 
 
 def select_diverse_beam(nodes: list[BeamNode], beam_width: int) -> list[BeamNode]:
-    """Keep the strongest unique machine-state signatures.
-
-    This intentionally does not collapse branches merely because they reached the
-    same X coordinate.  Distinct vertical/motion states remain separate search
-    hypotheses.
-    """
+    """Keep the strongest unique machine-state signatures."""
 
     ordered = sorted(
         nodes,
@@ -181,6 +230,25 @@ def save_node_checkpoint(core: MesenCore, path: Path) -> tuple[object, int, int,
     return observation, frame, x, engine
 
 
+def format_beam_depth(depth: int, frontier: list[BeamNode]) -> list[str]:
+    lines = [
+        f"  Beam depth {depth}: keeping {len(frontier)} distinct future machine states"
+    ]
+    for index, node in enumerate(frontier, start=1):
+        lines.append(
+            f"    [{index}] first action: {action_label(node.root_candidate_name)}"
+        )
+        lines.append(
+            f"        projected state: {motion_summary(node.observation)}"
+        )
+        lines.append(
+            f"        progress: {node.progress:+d} | best X reached: {node.max_x} | "
+            f"status: {terminal_label(node.terminal)} | score: {node_score(node):.3f}"
+        )
+        lines.append(f"        path: {path_summary(node.trace)}")
+    return lines
+
+
 def beam_audit(
     core: MesenCore,
     root_state_file: Path,
@@ -192,12 +260,7 @@ def beam_audit(
     beam_depth: int,
     beam_width: int,
 ) -> tuple[str, tuple[str, ...]]:
-    """Search a bounded, state-diverse checkpoint beam and return root action.
-
-    Depth 1 always evaluates all four root candidates.  Later depths expand every
-    retained beam node with the same four action macros, deduplicate exact motion
-    signatures, and keep only the strongest bounded frontier.
-    """
+    """Search a bounded, state-diverse checkpoint beam and return root action."""
 
     audit_dir = root_state_file.parent / "v5-beam"
     if audit_dir.exists():
@@ -231,20 +294,9 @@ def beam_audit(
             )
         )
 
-    # Keep all distinct root candidates at depth 1 so a tie cannot erase an
-    # alternative root action before its future state has been tested.
     frontier = select_diverse_beam(frontier, max(beam_width, len(CANDIDATES)))
     log_lines: list[str] = []
-    log_lines.append(
-        "Beam      : depth=1 "
-        + " | ".join(
-            f"root={n.root_candidate_name},x={n.observation.mario_x_abs},"
-            f"y={n.observation.mario_y},ps={n.observation.player_state},"
-            f"xs={n.observation.player_x_speed},ys={n.observation.player_y_speed},"
-            f"score={node_score(n):.3f},term={n.terminal.value}"
-            for n in frontier
-        )
-    )
+    log_lines.extend(format_beam_depth(1, frontier))
 
     for depth in range(2, beam_depth + 1):
         if not frontier:
@@ -300,17 +352,7 @@ def beam_audit(
                 )
 
         frontier = select_diverse_beam(children, beam_width)
-        log_lines.append(
-            f"Beam      : depth={depth} "
-            + " | ".join(
-                f"root={n.root_candidate_name},x={n.observation.mario_x_abs},"
-                f"y={n.observation.mario_y},ps={n.observation.player_state},"
-                f"xs={n.observation.player_x_speed},ys={n.observation.player_y_speed},"
-                f"score={node_score(n):.3f},term={n.terminal.value},"
-                f"path={'>' .join(n.trace)}"
-                for n in frontier
-            )
-        )
+        log_lines.extend(format_beam_depth(depth, frontier))
 
     if not frontier:
         return CANDIDATES[0].name, tuple(log_lines)
@@ -324,11 +366,14 @@ def beam_audit(
             -root_order[node.root_candidate_name],
         ),
     )
+    log_lines.append("  Beam search choice:")
+    log_lines.append(f"    first action: {action_label(best.root_candidate_name)}")
     log_lines.append(
-        f"BeamPick  : root={best.root_candidate_name} score={node_score(best):.3f} "
-        f"x={best.observation.mario_x_abs} max_x={best.max_x} "
-        f"term={best.terminal.value} path={'>'.join(best.trace)}"
+        f"    projected result: X={best.observation.mario_x_abs}, "
+        f"progress={best.progress:+d}, best X={best.max_x}, "
+        f"status={terminal_label(best.terminal)}, score={node_score(best):.3f}"
     )
+    log_lines.append(f"    projected path: {path_summary(best.trace)}")
     return best.root_candidate_name, tuple(log_lines)
 
 
@@ -336,14 +381,19 @@ def finish_success(core: MesenCore, current, episode: EpisodeAccumulator, timeou
     if current.game_engine_subroutine == FLAGPOLE_SLIDE:
         current = finish_flagpole(core, current, episode, timeout_s)
     result = episode.finish(EpisodeTermination.LEVEL_COMPLETE)
-    print(f"LevelEdge : PASS frame={current.native_frame_id} X={current.mario_x_abs}", flush=True)
+    print("\n=== LEVEL COMPLETE ===", flush=True)
     print(
-        f"Episode   : PASS termination={result.termination.value} "
-        f"frames={result.elapsed_frames} max_x={result.max_x} "
-        f"progress={result.net_progress} events={result.event_count}",
+        f"Mario reached the SMB1 level-complete state at frame {current.native_frame_id}, "
+        f"X={current.mario_x_abs}.",
         flush=True,
     )
-    print("PlannerV5 : PASS World 1-1 completion via state-diverse beam search", flush=True)
+    print(
+        f"Episode result: LEVEL COMPLETE | elapsed frames={result.elapsed_frames} | "
+        f"best X={result.max_x} | net progress={result.net_progress:+d} | "
+        f"events={result.event_count}",
+        flush=True,
+    )
+    print("PlannerV5: PASS - World 1-1 completed via state-diverse beam search", flush=True)
     print(READY_MARKER, flush=True)
     threading.Event().wait()
 
@@ -373,12 +423,14 @@ def worker(args: argparse.Namespace) -> None:
     state_file.parent.mkdir(parents=True, exist_ok=True)
     nominal_progress = 0
 
-    print(
-        "PlannerV5 : 30-frame fast loop + state-diverse beam audit; "
-        f"beam_depth={args.beam_depth} beam_width={args.beam_width} "
-        f"audit_interval={args.audit_interval}",
-        flush=True,
-    )
+    print("\n=== Planner V5 ===", flush=True)
+    print("Control step   : 30 frames per committed action", flush=True)
+    print(f"Beam lookahead : up to {args.beam_depth} decisions ({args.beam_depth * 30} frames)", flush=True)
+    print(f"Beam width     : keep up to {args.beam_width} distinct machine states", flush=True)
+    print(f"Safety audit   : every {args.audit_interval} decisions, plus stalled/degraded states", flush=True)
+    print("Actions        :", flush=True)
+    for candidate in CANDIDATES:
+        print(f"  - {action_label(candidate.name)}", flush=True)
 
     for decision in range(1, args.max_decisions + 1):
         state = read_smb1_state(core)
@@ -407,7 +459,26 @@ def worker(args: argparse.Namespace) -> None:
             args.audit_interval,
         )
 
+        print("\n------------------------------------------------------------", flush=True)
+        print(
+            f"Decision #{decision:03d} | frame {checkpoint_frame} | Mario X={checkpoint_x}",
+            flush=True,
+        )
+        print("Immediate 30-frame choices:", flush=True)
+        for outcome in one_ply:
+            print(
+                f"  {action_label(outcome.candidate.name):40s} -> {outcome_summary(outcome)}",
+                flush=True,
+            )
+
         if use_audit:
+            print("", flush=True)
+            print(
+                "Safety audit: "
+                + AUDIT_REASON_LABELS.get(reason, reason)
+                + f" | lookahead={args.beam_depth} decisions | keep={args.beam_width} states",
+                flush=True,
+            )
             root_name, beam_log = beam_audit(
                 core,
                 state_file,
@@ -422,11 +493,9 @@ def worker(args: argparse.Namespace) -> None:
             for line in beam_log:
                 print(line, flush=True)
             best = next(outcome for outcome in one_ply if outcome.candidate.name == root_name)
-            print(
-                f"Audit     : decision={decision:03d} frame={checkpoint_frame} X={checkpoint_x} "
-                f"reason={reason} depth={args.beam_depth} width={args.beam_width}",
-                flush=True,
-            )
+            decision_mode = "BEAM SEARCH"
+        else:
+            decision_mode = "FAST 30-FRAME SEARCH"
 
         safe_progress = max(
             (o.progress for o in one_ply if o.terminal == CandidateTerminal.NONE),
@@ -434,16 +503,10 @@ def worker(args: argparse.Namespace) -> None:
         )
         nominal_progress = max(nominal_progress, safe_progress)
 
-        summary = " ".join(
-            f"{o.candidate.name}:score={score_candidate(o):.3f},"
-            f"dx={o.progress},term={o.terminal.value},flag={int(o.reached_flagpole)}"
-            for o in one_ply
-        )
-        print(
-            f"Decision  : {decision:03d} frame={checkpoint_frame} X={checkpoint_x} "
-            f"choose={best.candidate.name} mode={'beam' if use_audit else 'fast'} | {summary}",
-            flush=True,
-        )
+        print("", flush=True)
+        print(f"Selected action: {action_label(best.candidate.name)}", flush=True)
+        print(f"Decision mode  : {decision_mode}", flush=True)
+        print(f"Expected result: {outcome_summary(best)}", flush=True)
 
         restore_checkpoint(core, state_file, checkpoint_frame, checkpoint_x, checkpoint_engine)
         current, terminal, reached_flagpole = commit_candidate(
@@ -454,11 +517,18 @@ def worker(args: argparse.Namespace) -> None:
             args.step_timeout,
         )
 
+        print(
+            f"Committed state: frame={current.native_frame_id} | "
+            f"{motion_summary(current)}",
+            flush=True,
+        )
+
         if terminal == CandidateTerminal.DEATH:
             result = episode.finish(EpisodeTermination.DEATH)
             fail(
-                f"PlannerV5 : FAIL selected rollout died frame={current.native_frame_id} "
-                f"X={current.mario_x_abs} max_x={result.max_x}"
+                "PlannerV5: FAIL - selected action led to DEATH | "
+                f"frame={current.native_frame_id} | X={current.mario_x_abs} | "
+                f"best X this episode={result.max_x}"
             )
         if terminal == CandidateTerminal.LEVEL_COMPLETE:
             finish_success(core, current, episode, args.step_timeout)
@@ -467,8 +537,9 @@ def worker(args: argparse.Namespace) -> None:
 
     result = episode.finish(EpisodeTermination.TIMEOUT)
     fail(
-        f"PlannerV5 : FAIL decision limit={args.max_decisions} "
-        f"frame={current.native_frame_id} X={current.mario_x_abs} max_x={result.max_x}"
+        "PlannerV5: FAIL - decision limit reached | "
+        f"limit={args.max_decisions} | frame={current.native_frame_id} | "
+        f"X={current.mario_x_abs} | best X={result.max_x}"
     )
 
 
