@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import time
 from pathlib import Path
 from typing import Iterable
 
@@ -245,26 +244,7 @@ class MesenCore:
         self._bind_fami_pixel_exports()
         return int(self._dll.FamiPixelGetFrameCount())
 
-    def _wait_for_stopped(self, timeout_ms: int) -> bool:
-        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
-        while time.monotonic() <= deadline:
-            if self.is_execution_stopped():
-                return True
-            time.sleep(0.001)
-        return self.is_execution_stopped()
-
     def step_frame_sync(self, count: int = 1, timeout_ms: int = 2000) -> None:
-        """Advance an exact number of PPU frames with bounded race recovery.
-
-        Save-state restores and heavy checkpoint search can briefly leave the
-        debugger at a stop/notification boundary even after authoritative RAM
-        and frame state are already readable. Before stepping, wait for the
-        debugger stop gate. If the native frame-event wait reports status 4,
-        allow a short grace window for a late completion. Retry only when the
-        frame count is unchanged *and* execution is stopped, which avoids
-        issuing a duplicate step against an in-flight transition.
-        """
-
         if not self._debugger_initialized:
             raise MesenLoadError("initialize_debugger() must be called before stepping.")
         if count < 1:
@@ -272,45 +252,17 @@ class MesenCore:
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be >= 0")
         self._bind_fami_pixel_exports()
-
-        if not self._wait_for_stopped(timeout_ms):
-            raise MesenLoadError(
-                "FamiPixelStepFrame precondition failed: debugger did not reach stopped state."
-            )
-
-        meanings = {
-            1: "emulator is not running",
-            2: "debugger is not initialized",
-            3: "invalid frame count",
-            4: "timeout waiting for native frame advance",
-            5: "timeout waiting for the new debugger stop",
-        }
-
-        for attempt in range(2):
-            before = self.frame_count()
-            status = int(self._dll.FamiPixelStepFrame(count, timeout_ms))
-            if status == 0:
-                return
-
-            if status == 4:
-                target = before + count
-                grace_deadline = time.monotonic() + min(max(timeout_ms, 250), 1000) / 1000.0
-                while time.monotonic() <= grace_deadline:
-                    current = self.frame_count()
-                    if current >= target and self.is_execution_stopped():
-                        return
-                    time.sleep(0.001)
-
-                current = self.frame_count()
-                if attempt == 0 and current == before and self.is_execution_stopped():
-                    continue
-
+        status = int(self._dll.FamiPixelStepFrame(count, timeout_ms))
+        if status != 0:
+            meanings = {
+                1: "emulator is not running",
+                2: "debugger is not initialized",
+                3: "invalid frame count",
+                4: "timeout waiting for native frame advance",
+                5: "timeout waiting for the new debugger stop",
+            }
             detail = meanings.get(status, "unknown native status")
             raise MesenLoadError(f"FamiPixelStepFrame failed ({status}: {detail}).")
-
-        raise MesenLoadError(
-            "FamiPixelStepFrame failed after one safe retry with no frame advance."
-        )
 
     def save_state_slot(self, state_index: int) -> None:
         if state_index < 0:
