@@ -92,9 +92,69 @@ DIED             >> rejected by dominant negative score
 
 `0x04 FlagpoleSlide` is used only as a planning preference because it is the verified precursor to the M1 terminal witness `0x05 PlayerEndLevel`; it does not redefine `LEVEL_COMPLETED`.
 
+## First machine run of the one-ply planner
+
+The first complete machine run validated that checkpoint search itself works. The planner avoided locally fatal choices at several points:
+
+```text
+Decision 007 @ X=279
+  cruise    -> death
+  tap_jump  -> safe +45
+  selected  -> tap_jump
+
+Decision 017 @ X=686
+  cruise    -> death
+  long_jump -> safe +45
+  selected  -> long_jump
+```
+
+However, the run also exposed a genuine one-ply planning failure rather than an emulator or event-contract failure.
+
+At `X=1226`, all four 30-frame candidates produced the same immediate progress (`dx=40`). Deterministic tie-breaking therefore selected `cruise`. The committed state reached `X=1266`, after which every 30-frame candidate produced zero immediate progress for several decisions. Eventually every candidate entered a terminal death path:
+
+```text
+Decision 029 frame=1036 X=1226
+  cruise/tap/medium/long -> dx=40, all tied
+  selected cruise
+
+Decision 030..034 X=1266
+  all candidates -> dx=0, terminal=none
+
+Decision 035 X=1266
+  all candidates -> death
+```
+
+This is a horizon/state-aliasing problem: equal immediate progress hid materially different future states. The one-ply planner could not distinguish an action that merely reaches the same X from one that reaches it with a better future trajectory.
+
+The earlier transient `FamiPixelStepFrame` timeout seen immediately after the title screen did not reproduce on the following run; the full planner then executed through 35 decisions. It is therefore recorded separately from the planning failure and is not currently treated as the main blocker.
+
+## Adaptive two-ply planner
+
+`examples/mesen_smb_checkpoint_planner_v2.py` extends the experiment without adding hard-coded SMB1 hazard coordinates.
+
+The default remains one-ply receding-horizon search. A second ply is enabled only when the current one-ply result is ambiguous and degraded relative to previously observed safe progress, or when no candidate makes progress:
+
+```text
+normal state
+  → evaluate 4 first-ply candidates
+  → commit best first-ply action
+
+ambiguous/degraded state
+  → evaluate 4 first-ply candidates
+  → from each safe endpoint, checkpoint again
+  → evaluate the same 4 candidate continuations
+  → rank each first action by its best real second-ply continuation
+  → restore root checkpoint
+  → commit only the selected first action
+```
+
+This preserves the receding-horizon architecture and Mesen authority while giving the planner enough lookahead to distinguish equal immediate-X outcomes with different future consequences.
+
+The trigger is data-derived rather than coordinate-derived: the planner tracks the best safe 30-frame progress already observed (`nominal_progress`). Two-ply search is used when the best immediate outcome is tied yet below that nominal capability, or when all immediate progress is non-positive.
+
 ## What this is not
 
-This first planner is not A*, MCTS, PPO, DQN, or a learned world model. It is the minimum real checkpoint-search mechanism needed before those consumers can be evaluated cleanly.
+This planner is not A*, MCTS, PPO, DQN, or a learned world model. It is the minimum real checkpoint-search mechanism needed before those consumers can be evaluated cleanly.
 
 Future planners may replace the ranking/search strategy while retaining the same architecture:
 
