@@ -221,7 +221,12 @@ class MesenCore:
         self._debugger_initialized = True
 
     def release_debugger(self) -> None:
-        """Release Mesen's debugger without releasing the emulator itself."""
+        """Release Mesen's debugger explicitly.
+
+        M0 teardown should normally call stop() while the debugger is still
+        attached and let Mesen tear debugger state down as part of Stop().
+        This direct wrapper is retained for later controlled lifecycle tests.
+        """
         if self._debugger_initialized and not self._released:
             self._dll.ReleaseDebugger()
             self._debugger_initialized = False
@@ -236,18 +241,24 @@ class MesenCore:
         self._dll.ResumeExecution()
 
     def stop(self) -> None:
+        """Stop emulation; Mesen also resets active debugger state here."""
         if self._initialized and not self._released:
             self._dll.Stop()
+            self._debugger_initialized = False
 
     def release(self) -> None:
-        """Release debugger and native emulator exactly once."""
+        """Release the native emulator exactly once.
+
+        Do not pre-release the debugger here. Upstream Emulator::Release() calls
+        Stop(true), and Stop() owns debugger reset/teardown. Releasing the
+        debugger first while the emulation thread is live can leave Stop()
+        waiting on that thread during teardown.
+        """
         if self._released:
             return
-        if self._debugger_initialized:
-            self._dll.ReleaseDebugger()
-            self._debugger_initialized = False
         if self._initialized:
             self._dll.Release()
+        self._debugger_initialized = False
         self._released = True
 
     def __enter__(self) -> "MesenCore":
