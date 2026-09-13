@@ -3,9 +3,11 @@ import pytest
 from fami_pixel.adapters.mesen import NES_A, NES_LEFT, NES_RIGHT
 from fami_pixel.games.smb1 import (
     ActionCommand,
+    GameEventType,
     Smb1Action,
     Smb1State,
     action_to_nes_buttons,
+    derive_game_events,
     observation_from_state,
 )
 
@@ -27,6 +29,27 @@ def _state() -> Smb1State:
         player_y_speed=0,
         saved_joypad1=0,
     )
+
+
+def _observation(frame_id: int, *, x: int, state: int, y: int = 0xB0):
+    source = _state()
+    source = Smb1State(
+        frame_counter=source.frame_counter,
+        oper_mode=source.oper_mode,
+        oper_mode_task=source.oper_mode_task,
+        game_engine_subroutine=source.game_engine_subroutine,
+        world=source.world,
+        level=source.level,
+        player_page=(x >> 8) & 0xFF,
+        player_x=x & 0xFF,
+        player_y_high=source.player_y_high,
+        player_y=y,
+        player_state=state,
+        player_x_speed=source.player_x_speed,
+        player_y_speed=source.player_y_speed,
+        saved_joypad1=source.saved_joypad1,
+    )
+    return observation_from_state(frame_id, source)
 
 
 def test_action_mapping_matches_native_nes_bytes() -> None:
@@ -59,3 +82,37 @@ def test_observation_projects_authoritative_state() -> None:
     assert observation.player_state == 0
     assert observation.raw_joypad == 0
     assert observation.is_player_control
+
+
+def test_events_derive_movement_and_jump_start() -> None:
+    previous = _observation(256, x=99, state=0)
+    current = _observation(257, x=100, state=1, y=0xAC)
+
+    events = derive_game_events(previous, current)
+
+    assert [event.kind for event in events] == [
+        GameEventType.MOVED,
+        GameEventType.JUMP_STARTED,
+    ]
+    assert events[0].delta_x == 1
+    assert events[0].frame_id == 257
+
+
+def test_events_derive_landing() -> None:
+    previous = _observation(280, x=130, state=1, y=0xA0)
+    current = _observation(281, x=131, state=0, y=0xB0)
+
+    events = derive_game_events(previous, current)
+
+    assert [event.kind for event in events] == [
+        GameEventType.MOVED,
+        GameEventType.LANDED,
+    ]
+
+
+def test_events_reject_nonmonotonic_frames() -> None:
+    previous = _observation(257, x=100, state=0)
+    current = _observation(257, x=101, state=0)
+
+    with pytest.raises(ValueError):
+        derive_game_events(previous, current)
