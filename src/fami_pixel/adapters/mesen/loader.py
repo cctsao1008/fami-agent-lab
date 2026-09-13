@@ -238,25 +238,20 @@ class MesenCore:
         self._dll.ResumeExecution()
 
     def step_ppu_frame(self, count: int = 1) -> None:
-        """Request one or more NES PPU-frame debugger steps.
+        """Install a NES PPU-frame debugger step request.
 
-        `Debugger::Step()` installs a new step request. When execution is already
-        stopped at the previous step boundary, that request does not advance the
-        machine until `ResumeExecution()` is issued. Track the pre-call stopped
-        state so repeated host-side frame stepping actually resumes execution.
-
-        The first request made while the emulator is running needs no explicit
-        resume; Mesen will stop when the requested PPU-frame count is reached.
+        Do not pair this with ResumeExecution() after the call: upstream
+        Debugger::Run(), which backs ResumeExecution(), clears each CPU
+        debugger's current StepRequest. DebugBreakHelper inside Step() is
+        responsible for the temporary host-thread break/release around request
+        installation. Completion must be witnessed separately; a stale
+        IsExecutionStopped()==True is not sufficient evidence of advancement.
         """
         if not self._debugger_initialized:
             raise MesenLoadError("initialize_debugger() must be called before stepping.")
         if count < 1:
             raise ValueError("count must be >= 1")
-
-        was_stopped = self.is_execution_stopped()
         self._dll.Step(CPU_TYPE_NES, count, STEP_TYPE_PPU_FRAME)
-        if was_stopped:
-            self._dll.ResumeExecution()
 
     def stop(self) -> None:
         if self._initialized and not self._released:
