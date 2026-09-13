@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fami-agent-lab"
+name = "fami-pixel"
 version = "0.0.1"
 description = "Low-overhead Python control and observation experiments for Famicom / NES games via Mesen CE."
 readme = "README.md"
