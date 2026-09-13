@@ -6,7 +6,7 @@ It is intentionally a **technical summary**, not a transcription of the manual. 
 
 ## Why this matters
 
-The current planner work exposed a structural limitation in fixed Mario action macros: several 30-frame candidates can produce the same forward progress while reaching materially different machine states, and later collapse into the same doomed trajectory.
+The planner work exposed a structural limitation in fixed Mario action macros: several 30-frame candidates can produce the same forward progress while reaching materially different machine states, and later collapse into the same doomed trajectory.
 
 The official control description is useful because it clarifies that SMB1 movement is not naturally organized as a few fixed jump macros. It is a short-horizon control problem with independently meaningful horizontal, jump-hold, and acceleration inputs.
 
@@ -85,7 +85,7 @@ experiment quality objectives
 
 ## Control model suggested by the manual
 
-A more faithful controller model is:
+A faithful controller model is:
 
 ```text
 Horizontal intent
@@ -118,35 +118,53 @@ short control sequence
 reachable future states
 ```
 
-## Implication for V6 and later planners
+## Current implementation: V7
 
-The immediate V6 direction remains valid:
+V7 now implements this control model directly rather than postponing B support to a later experiment.
 
-- coarse normal mode,
-- precision mode when progress degrades or candidate states converge,
-- shorter frame durations,
-- NOOP / LEFT / A / LEFT+A / RIGHT / RIGHT+A primitives.
-
-However, this manual suggests an important next refinement: avoid solving every new situation by adding another fixed macro.
-
-The longer-term candidate generator should search short controller-state sequences such as:
+The durable action contract includes:
 
 ```text
-RIGHT+B 8f
-→ RIGHT+A+B 8f
-→ RIGHT+B 4f
-→ RIGHT 4f
+NOOP
+A
+B
+RIGHT
+RIGHT+A
+RIGHT+B
+RIGHT+A+B
+LEFT
+LEFT+A
+LEFT+B
+LEFT+A+B
 ```
 
-or:
+The planner uses two rates:
 
 ```text
-RIGHT+A 8f
-→ RIGHT 4f
-→ LEFT 4f
+coarse mode
+  30-frame walk/run and jump/run-jump macros
+
+precision mode
+  4/8/12-frame controller primitives
+  spanning horizontal intent, A state, and B state
 ```
 
-The exact sequences must still be evaluated against authoritative Mesen state.
+Representative V7 coarse candidates include:
+
+```text
+RIGHT 30f
+RIGHT+A 6f  -> RIGHT 24f
+RIGHT+B 30f
+RIGHT+A+B 6f -> RIGHT+B 24f
+RIGHT+A+B 14f -> RIGHT+B 16f
+RIGHT+A+B 24f -> RIGHT+B 6f
+```
+
+Precision search additionally covers short `NOOP`, `A`, `B`, LEFT/RIGHT, LEFT/RIGHT+A, LEFT/RIGHT+B, and LEFT/RIGHT+A+B commands. This allows run-up, jump-hold, and airborne steering to be searched as independent control dimensions.
+
+V7 also accepts a prior test-report ZIP directly and can locate named regression fixtures (`pre-collapse`, `collapse-boundary`, `doomed`) without manually extracting or renaming `.mss` files.
+
+All candidate trajectories remain counterfactual until their first root command is selected and committed against authoritative Mesen state.
 
 ## Secondary commentary references
 
@@ -210,14 +228,14 @@ This keeps the control model faithful to documented gameplay while preserving th
 
 ## Current design takeaway
 
-For Fami Pixel, the strongest durable takeaway is:
+For Fami Pixel, the durable direction is now implemented in V7:
 
 ```text
-SMB1 planning should evolve from
 fixed macro-action search
-
-toward
+        ↓
+adaptive coarse / precision control
+        ↓
 short-horizon controller-sequence search
 ```
 
-because jump height, airborne steering, and running speed are independently controllable and jointly determine Mario's reachable future states.
+Jump hold, airborne steering, and running speed are independently controllable and jointly determine Mario's reachable future states.
