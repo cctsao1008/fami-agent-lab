@@ -71,6 +71,7 @@ class MesenCore:
             raise MesenLoadError(f"Failed to load {self.path}: {exc}") from exc
 
         self._initialized = False
+        self._debugger_initialized = False
         self._released = False
         self._bind_verified_exports()
 
@@ -117,6 +118,21 @@ class MesenCore:
 
             self._dll.Stop.argtypes = []
             self._dll.Stop.restype = None
+
+            self._dll.InitializeDebugger.argtypes = []
+            self._dll.InitializeDebugger.restype = None
+
+            self._dll.ReleaseDebugger.argtypes = []
+            self._dll.ReleaseDebugger.restype = None
+
+            self._dll.IsDebuggerRunning.argtypes = []
+            self._dll.IsDebuggerRunning.restype = ctypes.c_bool
+
+            self._dll.IsExecutionStopped.argtypes = []
+            self._dll.IsExecutionStopped.restype = ctypes.c_bool
+
+            self._dll.ResumeExecution.argtypes = []
+            self._dll.ResumeExecution.restype = None
 
             self._dll.Release.argtypes = []
             self._dll.Release.restype = None
@@ -190,14 +206,46 @@ class MesenCore:
     def resume(self) -> None:
         self._dll.Resume()
 
+    def initialize_debugger(self) -> None:
+        """Initialize Mesen's debugger after the emulator/ROM are live."""
+        if not self._initialized:
+            raise MesenLoadError(
+                "initialize_headless() must be called before initialize_debugger()."
+            )
+        if self._released:
+            raise MesenLoadError("MesenCore instance has already been released.")
+        if self._debugger_initialized:
+            return
+
+        self._dll.InitializeDebugger()
+        self._debugger_initialized = True
+
+    def release_debugger(self) -> None:
+        """Release Mesen's debugger without releasing the emulator itself."""
+        if self._debugger_initialized and not self._released:
+            self._dll.ReleaseDebugger()
+            self._debugger_initialized = False
+
+    def is_debugger_running(self) -> bool:
+        return bool(self._dll.IsDebuggerRunning())
+
+    def is_execution_stopped(self) -> bool:
+        return bool(self._dll.IsExecutionStopped())
+
+    def resume_execution(self) -> None:
+        self._dll.ResumeExecution()
+
     def stop(self) -> None:
         if self._initialized and not self._released:
             self._dll.Stop()
 
     def release(self) -> None:
-        """Release the native emulator exactly once."""
+        """Release debugger and native emulator exactly once."""
         if self._released:
             return
+        if self._debugger_initialized:
+            self._dll.ReleaseDebugger()
+            self._debugger_initialized = False
         if self._initialized:
             self._dll.Release()
         self._released = True
