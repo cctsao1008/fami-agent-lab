@@ -4,6 +4,13 @@ from .actions import ActionCommand, Smb1Action, action_to_nes_buttons
 from .episode import EpisodeAccumulator, EpisodeResult, EpisodeTermination
 from .events import GameEvent, GameEventType, derive_game_events
 from .observation import Smb1Observation, observation_from_state, read_smb1_observation
+from .planning import (
+    CandidateOutcome,
+    CandidateTerminal,
+    PlanCandidate,
+    score_candidate,
+    select_best_candidate,
+)
 from .state import (
     GAME_MODE,
     PLAYER_CONTROL_SUBROUTINE,
@@ -14,6 +21,8 @@ from .state import (
 
 __all__ = [
     "ActionCommand",
+    "CandidateOutcome",
+    "CandidateTerminal",
     "EpisodeAccumulator",
     "EpisodeResult",
     "EpisodeTermination",
@@ -21,6 +30,7 @@ __all__ = [
     "GameEvent",
     "GameEventType",
     "PLAYER_CONTROL_SUBROUTINE",
+    "PlanCandidate",
     "Smb1Action",
     "Smb1Observation",
     "TITLE_SCREEN_MODE",
@@ -30,4 +40,6 @@ __all__ = [
     "observation_from_state",
     "read_smb1_observation",
     "read_smb1_state",
+    "score_candidate",
+    "select_best_candidate",
 ]
