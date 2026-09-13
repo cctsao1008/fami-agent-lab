@@ -100,3 +100,25 @@ current  GameEngineSubroutine == 0x0B
 ```
 
 The observed authoritative transition was `0x08 -> 0x0B` at native frame 387. The edge-triggered event emitted exactly once, and a 12-frame duplicate-suppression window emitted no additional `DIED` events.
+
+### Level-complete probe attempt 1 — periodic grounded jumps
+
+The first real World 1-1 completion probe used RIGHT plus repeated grounded A pulses. Unit contracts remained clean (`14 passed in 0.25s`), but the gameplay baseline stalled at `X=722` and never reached a terminal engine transition before the supervisor deadline:
+
+```text
+GameEntry : PASS NativeFrame=196 X=40 Engine=0x08
+Progress  : frame=496  X=415 Engine=0x08
+Progress  : frame=796  X=722 Engine=0x08
+...
+Progress  : frame=5296 X=722 Engine=0x08
+Supervisor: FAIL (worker exit code 1)
+```
+
+This does not contradict the `LEVEL_COMPLETED` event definition. It shows that the first scripted baseline was not sufficient to traverse the obstacle at the observed `X=722` plateau, and that the original 180-second supervisor window was too short for the configured 7200-frame run.
+
+The completion probe was therefore revised in two ways without fabricating game state:
+
+1. extend the supervisor timeout to 600 seconds,
+2. detect lack of forward progress and escalate grounded jumps to a longer A hold while continuing RIGHT.
+
+The revised probe logs `StallJump` and `max_x` so future failures identify whether the controller actually escapes the plateau.
