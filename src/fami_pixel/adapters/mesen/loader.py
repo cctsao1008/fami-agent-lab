@@ -56,6 +56,7 @@ M0_EXPORTS: tuple[str, ...] = (
     "FamiPixelGetFrameCount",
     "FamiPixelSetNesControllerState",
     "FamiPixelGetNesControllerState",
+    "FamiPixelCopyNesFrame",
 )
 
 
