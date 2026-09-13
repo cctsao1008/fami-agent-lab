@@ -1,6 +1,7 @@
 """Super Mario Bros. game-specific decoding and M1 environment contracts."""
 
 from .actions import ActionCommand, Smb1Action, action_to_nes_buttons
+from .episode import EpisodeAccumulator, EpisodeResult, EpisodeTermination
 from .events import GameEvent, GameEventType, derive_game_events
 from .observation import Smb1Observation, observation_from_state, read_smb1_observation
 from .state import (
@@ -13,6 +14,9 @@ from .state import (
 
 __all__ = [
     "ActionCommand",
+    "EpisodeAccumulator",
+    "EpisodeResult",
+    "EpisodeTermination",
     "GAME_MODE",
     "GameEvent",
     "GameEventType",
