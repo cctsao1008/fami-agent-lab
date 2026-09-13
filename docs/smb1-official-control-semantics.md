@@ -148,6 +148,47 @@ RIGHT+A 8f
 
 The exact sequences must still be evaluated against authoritative Mesen state.
 
+## Secondary commentary references
+
+A useful secondary reading is David Oxford's 2015 PoisonMushroom.Org article, “Let's Read the Original Super Mario Bros. Manual”:
+
+https://poisonmushroom.org/2015/09/lets-read-the-original-super-mario-bros-manual/
+
+This article is **not normative**. It is a retrospective walkthrough and commentary on the original manual, useful mainly for:
+
+- navigating the manual by topic,
+- preserving historical naming and context,
+- noticing sections that deserve primary-source follow-up,
+- identifying richer gameplay interactions for later environment tests.
+
+Examples highlighted in the article include:
+
+- the manual's control and world-layout explanations,
+- Mario forms and historical terminology,
+- explicit discussion of death conditions,
+- enemy descriptions and behavior context,
+- the “Bulldozer Attack” shell-interaction sequence,
+- off-screen interaction quirks described in the manual.
+
+Engineering implication:
+
+The article reinforces that many SMB1 behaviors are **multi-stage interaction sequences**, not single button presses. The “Bulldozer Attack” is especially useful as a future regression or capability test because it requires timed contact, shell state, relative position, follow-up movement, and environmental interaction.
+
+Authority remains:
+
+```text
+Official manual
+  = primary documentary source for stated controls / rules
+
+Secondary commentary
+  = context, navigation, historical interpretation
+
+Mesen + SMB1 decoder
+  = executable machine truth
+```
+
+Any behavior inferred from the commentary should be checked against either the official manual or actual machine evidence before entering a planner contract.
+
 ## Planner design rule
 
 Do not encode manual statements as machine truth.
