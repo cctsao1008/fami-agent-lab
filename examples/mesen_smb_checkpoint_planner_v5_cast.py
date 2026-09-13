@@ -96,10 +96,6 @@ def strip_wrapper_option(argv: list[str], name: str) -> list[str]:
     return result
 
 
-def has_option(argv: list[str], name: str) -> bool:
-    return any(arg == name or arg.startswith(name + "=") for arg in argv)
-
-
 def build_test_report_zip(
     capture_dir: Path,
     report_dir: Path,
@@ -164,8 +160,8 @@ def main() -> int:
     report_dir = extract_option(raw_args, "--report-dir", DEFAULT_REPORT_DIR).expanduser().resolve()
 
     planner_args = strip_wrapper_option(raw_args, "--report-dir")
-    if not has_option(planner_args, "--capture-dir"):
-        planner_args.extend(["--capture-dir", str(capture_dir)])
+    planner_args = strip_wrapper_option(planner_args, "--capture-dir")
+    planner_args.extend(["--capture-dir", str(capture_dir)])
     command = [sys.executable, str(planner), *planner_args]
 
     report_dir.mkdir(parents=True, exist_ok=True)
