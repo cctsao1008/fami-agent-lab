@@ -27,6 +27,7 @@ from fami_pixel.adapters.mesen import (
 
 
 READY_MARKER = "WorkerReady: TERMINATE_FROM_SUPERVISOR"
+FAIL_MARKER = "WorkerFail: TERMINATE_FROM_SUPERVISOR"
 
 # SMB1 symbols / controller bit masks from the byte-exact disassembly family.
 SMB_SAVED_JOYPAD_BITS = 0x06FC
@@ -65,7 +66,7 @@ def run_segment(core, controller, state, label, expected, first_frame, count, ti
         core.step_ppu_frame(1)
         if not wait_for_stop(core, timeout):
             print(f"Frame {frame:03d}: FAIL action={label} (no stopped state)", flush=True)
-            raise SystemExit(4)
+            return frame, failures + 1, False
         observed = read_nes_cpu_memory(core, SMB_SAVED_JOYPAD_BITS)
         ok = observed == expected
         if not ok:
@@ -76,7 +77,7 @@ def run_segment(core, controller, state, label, expected, first_frame, count, ti
             flush=True,
         )
         last_frame = frame
-    return last_frame, failures
+    return last_frame, failures, True
 
 
 def worker(args: argparse.Namespace) -> None:
@@ -93,7 +94,8 @@ def worker(args: argparse.Namespace) -> None:
     )
     if not core.load_rom(args.rom):
         print("LoadRom   : FAIL", flush=True)
-        raise SystemExit(1)
+        print(FAIL_MARKER, flush=True)
+        threading.Event().wait()
     print("LoadRom   : PASS", flush=True)
 
     core.initialize_debugger()
@@ -102,24 +104,40 @@ def worker(args: argparse.Namespace) -> None:
     print("InputSlots: " + " ".join(f"{i}={'yes' if v else 'no'}" for i, v in enumerate(slots)), flush=True)
     if not 0 <= args.controller < 8 or not slots[args.controller]:
         print(f"Controller: FAIL (slot {args.controller} unavailable)", flush=True)
-        raise SystemExit(5)
+        print(FAIL_MARKER, flush=True)
+        threading.Event().wait()
     print(f"Controller: PASS (slot {args.controller})", flush=True)
-    print(f"Observation: SMB SavedJoypadBits @ $06FC", flush=True)
+    print("Observation: SMB SavedJoypadBits @ $06FC", flush=True)
 
     frame = 1
     failures = 0
-    last, bad = run_segment(core, args.controller, right_state(), "RIGHT", SMB_RIGHT, frame, 60, args.step_timeout)
+    last, bad, stepped = run_segment(core, args.controller, right_state(), "RIGHT", SMB_RIGHT, frame, 60, args.step_timeout)
     failures += bad
+    if not stepped:
+        print(f"InputObservation: FAIL ({failures} failures)", flush=True)
+        print(FAIL_MARKER, flush=True)
+        threading.Event().wait()
     frame = last + 1
-    last, bad = run_segment(core, args.controller, right_state(jump=True), "RIGHT+A", SMB_RIGHT | SMB_A, frame, 10, args.step_timeout)
+
+    last, bad, stepped = run_segment(core, args.controller, right_state(jump=True), "RIGHT+A", SMB_RIGHT | SMB_A, frame, 10, args.step_timeout)
     failures += bad
+    if not stepped:
+        print(f"InputObservation: FAIL ({failures} failures)", flush=True)
+        print(FAIL_MARKER, flush=True)
+        threading.Event().wait()
     frame = last + 1
-    last, bad = run_segment(core, args.controller, released_state(), "RELEASE", 0x00, frame, 2, args.step_timeout)
+
+    last, bad, stepped = run_segment(core, args.controller, released_state(), "RELEASE", 0x00, frame, 2, args.step_timeout)
     failures += bad
+    if not stepped:
+        print(f"InputObservation: FAIL ({failures} failures)", flush=True)
+        print(FAIL_MARKER, flush=True)
+        threading.Event().wait()
 
     if failures:
         print(f"InputObservation: FAIL ({failures} mismatched frames)", flush=True)
-        raise SystemExit(6)
+        print(FAIL_MARKER, flush=True)
+        threading.Event().wait()
 
     print("InputObservation: PASS (72/72 frame-aligned native RAM observations)", flush=True)
     print("Sequence        : RIGHT x60 -> RIGHT+A x10 -> RELEASE x2", flush=True)
@@ -150,6 +168,7 @@ def supervisor(args: argparse.Namespace) -> int:
 
     deadline = time.monotonic() + args.timeout
     ready = False
+    failed = False
     assert process.stdout is not None
     try:
         while time.monotonic() < deadline:
@@ -158,6 +177,9 @@ def supervisor(args: argparse.Namespace) -> int:
                 print(line, end="")
                 if READY_MARKER in line:
                     ready = True
+                    break
+                if FAIL_MARKER in line:
+                    failed = True
                     break
                 continue
             if process.poll() is not None:
@@ -176,6 +198,10 @@ def supervisor(args: argparse.Namespace) -> int:
         print("WorkerExit: FORCED (expected containment)")
         print("Supervisor: PASS")
         return 0
+    if failed:
+        print("WorkerExit: FORCED (failed probe contained)")
+        print("Supervisor: FAIL")
+        return 6
 
     code = process.returncode
     print(f"Supervisor: FAIL (worker exit code {code})")
