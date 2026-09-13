@@ -28,18 +28,20 @@ class GameEvent:
     delta_x: int = 0
 
 
-# Narrow M1 movement heuristic grounded by the M0 gameplay witness:
-# player_state 0 was observed while grounded and player_state 1 while jumping.
-# Do not generalize other player_state values into airborne semantics yet.
 _GROUNDED_PLAYER_STATE = 0
 _JUMP_PLAYER_STATE = 1
 
-# SMB1 GameRoutines dispatch in the public disassembly:
+# SMB1 GameRoutines dispatch + machine evidence:
 #   $05 -> PlayerEndLevel
+#   $06 -> PlayerLoseLife
 #   $0B -> PlayerDeath
-# Entering either routine is the event edge. Staying in the routine on later
-# frames must not emit duplicate terminal events.
+#
+# Enemy collision validation entered $0B directly. A later World 1-1 traversal
+# showed pit/fall deaths can enter $06 directly from $08, bypassing $0B.
+# Therefore DIED has two authoritative entry paths. The $06 guard excludes
+# $0B->$06 so the bookkeeping transition does not emit a duplicate death.
 _PLAYER_END_LEVEL_SUBROUTINE = 0x05
+_PLAYER_LOSE_LIFE_SUBROUTINE = 0x06
 _PLAYER_DEATH_SUBROUTINE = 0x0B
 
 
@@ -47,13 +49,7 @@ def derive_game_events(
     previous: Smb1Observation,
     current: Smb1Observation,
 ) -> tuple[GameEvent, ...]:
-    """Derive validated events from two consecutive structured observations.
-
-    MOVED/JUMP_STARTED/LANDED are state-transition projections. DIED and
-    LEVEL_COMPLETED are emitted only on entry into the corresponding SMB1
-    GameEngineSubroutine, matching the public SMB disassembly's GameRoutines
-    dispatch table.
-    """
+    """Derive validated events from two consecutive structured observations."""
 
     if current.native_frame_id <= previous.native_frame_id:
         raise ValueError("current observation must be from a later native frame")
@@ -91,10 +87,19 @@ def derive_game_events(
             )
         )
 
-    if (
-        previous.game_engine_subroutine != _PLAYER_DEATH_SUBROUTINE
-        and current.game_engine_subroutine == _PLAYER_DEATH_SUBROUTINE
-    ):
+    previous_engine = previous.game_engine_subroutine
+    current_engine = current.game_engine_subroutine
+
+    entered_player_death = (
+        previous_engine != _PLAYER_DEATH_SUBROUTINE
+        and current_engine == _PLAYER_DEATH_SUBROUTINE
+    )
+    entered_direct_lose_life = (
+        previous_engine not in (_PLAYER_DEATH_SUBROUTINE, _PLAYER_LOSE_LIFE_SUBROUTINE)
+        and current_engine == _PLAYER_LOSE_LIFE_SUBROUTINE
+    )
+
+    if entered_player_death or entered_direct_lose_life:
         events.append(
             GameEvent(
                 kind=GameEventType.DIED,
@@ -103,8 +108,8 @@ def derive_game_events(
         )
 
     if (
-        previous.game_engine_subroutine != _PLAYER_END_LEVEL_SUBROUTINE
-        and current.game_engine_subroutine == _PLAYER_END_LEVEL_SUBROUTINE
+        previous_engine != _PLAYER_END_LEVEL_SUBROUTINE
+        and current_engine == _PLAYER_END_LEVEL_SUBROUTINE
     ):
         events.append(
             GameEvent(
