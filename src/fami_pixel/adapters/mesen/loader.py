@@ -127,6 +127,14 @@ class MesenCore:
             self._dll.ResumeExecution.restype = None
             self._dll.Step.argtypes = [ctypes.c_uint8, ctypes.c_uint32, ctypes.c_int]
             self._dll.Step.restype = None
+            self._dll.SaveState.argtypes = [ctypes.c_uint32]
+            self._dll.SaveState.restype = None
+            self._dll.LoadState.argtypes = [ctypes.c_uint32]
+            self._dll.LoadState.restype = None
+            self._dll.SaveStateFile.argtypes = [ctypes.c_char_p]
+            self._dll.SaveStateFile.restype = None
+            self._dll.LoadStateFile.argtypes = [ctypes.c_char_p]
+            self._dll.LoadStateFile.restype = None
             self._dll.Release.argtypes = []
             self._dll.Release.restype = None
         except AttributeError as exc:
@@ -255,6 +263,29 @@ class MesenCore:
             }
             detail = meanings.get(status, "unknown native status")
             raise MesenLoadError(f"FamiPixelStepFrame failed ({status}: {detail}).")
+
+    def save_state_slot(self, state_index: int) -> None:
+        if state_index < 0:
+            raise ValueError("state_index must be >= 0")
+        self._dll.SaveState(state_index)
+
+    def load_state_slot(self, state_index: int) -> None:
+        if state_index < 0:
+            raise ValueError("state_index must be >= 0")
+        self._dll.LoadState(state_index)
+
+    def save_state_file(self, filepath: str | os.PathLike[str]) -> Path:
+        path = Path(filepath).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._dll.SaveStateFile(self._native_path(path))
+        return path
+
+    def load_state_file(self, filepath: str | os.PathLike[str]) -> Path:
+        path = Path(filepath).expanduser().resolve()
+        if not path.is_file():
+            raise MesenLoadError(f"Save-state file not found: {path}")
+        self._dll.LoadStateFile(self._native_path(path))
+        return path
 
     def stop(self) -> None:
         if self._initialized and not self._released:
