@@ -64,6 +64,7 @@ def test_action_mapping_matches_native_nes_bytes() -> None:
     assert action_to_nes_buttons(Smb1Action.RIGHT) == NES_RIGHT
     assert action_to_nes_buttons(Smb1Action.RIGHT_A) == (NES_RIGHT | NES_A)
     assert action_to_nes_buttons(Smb1Action.LEFT) == NES_LEFT
+    assert action_to_nes_buttons(Smb1Action.LEFT_A) == (NES_LEFT | NES_A)
     assert action_to_nes_buttons(Smb1Action.A) == NES_A
 
 
