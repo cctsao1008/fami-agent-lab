@@ -63,7 +63,7 @@ Write-Host "MSBuild    : $MSBuild"
 Write-Host "Solution   : $Solution"
 Write-Host "Target     : InteropDLL"
 Write-Host "Config     : $Configuration|$Platform"
-Write-Host "Encoding   : UTF-8 (/utf-8)"
+Write-Host "Charset    : upstream/default; suppress C4819 only"
 Write-Host "Build mode : clean + build"
 Write-Host
 
@@ -72,22 +72,22 @@ Write-Host
 # $(SolutionDir); direct project invocation leaves that property without the
 # solution context and causes includes such as Utilities/... and Core/... to fail.
 #
-# Mesen source contains Unicode text. On Windows systems whose active ANSI code
-# page is not UTF-8 (for example Traditional Chinese CP950), MSVC emits C4819.
-# Mesen treats warnings as errors, which promotes that warning to C2220 and
-# stops the build. Inject /utf-8 through the documented CL environment variable
-# for this child build only, without modifying the upstream submodule.
+# Do not force /utf-8 globally here. At least one pinned upstream source file
+# contains legacy/mojibake byte sequences that MSVC rejects under code page
+# 65001 with C4828. On Traditional Chinese Windows, the default source code page
+# instead emits C4819 for characters that are not representable in CP950. Those
+# instances are in source text/comments, and Mesen's TreatWarningAsError setting
+# promotes C4819 to C2220. Suppress only C4819 for this child build while leaving
+# the upstream source interpretation otherwise unchanged.
 #
-# Because the compiler encoding switches are part of the precompiled-header
-# compatibility contract, switching from the default code page to /utf-8 while
-# reusing old PCH/object files produces C2855. Always clean the InteropDLL target
-# and its dependencies before rebuilding with the injected encoding option.
+# We still clean before rebuilding so PCH/object files created by prior attempts
+# with different compiler charset switches cannot be reused.
 $OriginalCL = [Environment]::GetEnvironmentVariable("CL", "Process")
 try {
     $env:CL = if ([string]::IsNullOrWhiteSpace($OriginalCL)) {
-        "/utf-8"
+        "/wd4819"
     } else {
-        "/utf-8 $OriginalCL"
+        "/wd4819 $OriginalCL"
     }
 
     Write-Host "Cleaning Mesen InteropDLL and dependencies..."
