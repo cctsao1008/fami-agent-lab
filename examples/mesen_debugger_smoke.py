@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """Probe headless Mesen debugger bring-up inside a supervised worker process.
 
-The current pinned Mesen CE build can deadlock during graceful teardown after the
-headless debugger has been initialized. Keep that native failure domain inside a
-child process so the caller retains control while the teardown contract is still
-under audit.
+The current pinned Mesen CE build can deadlock or fail-fast during process
+teardown after the headless debugger has been initialized. Keep that native
+failure domain inside a child process and let the supervisor terminate the child
+once the probe result has been emitted.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from fami_pixel.adapters.mesen import MesenCore
+
+
+READY_MARKER = "WorkerReady: TERMINATE_FROM_SUPERVISOR"
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +62,7 @@ def worker(args: argparse.Namespace) -> None:
 
     if not core.load_rom(args.rom):
         print("LoadRom   : FAIL", flush=True)
-        os._exit(1)
+        raise SystemExit(1)
     print("LoadRom   : PASS", flush=True)
     print(f"IsRunning : {core.is_running()}", flush=True)
 
@@ -67,12 +71,12 @@ def worker(args: argparse.Namespace) -> None:
     print(f"DbgRunning: {core.is_debugger_running()}", flush=True)
     print(f"ExecStop  : {core.is_execution_stopped()}", flush=True)
 
-    # Do not call Stop(), ReleaseDebugger(), or Release() here yet. Two real
-    # Windows runs showed that the pinned native build can block indefinitely in
-    # teardown after headless debugger initialization. The worker process is the
-    # containment boundary while that upstream lifetime contract is audited.
-    print("WorkerExit: HARD (teardown audit pending)", flush=True)
-    os._exit(0)
+    # Do not run Python/CRT/DLL teardown in this worker. A real Windows run
+    # reached this point and then exited with 0xC0000409 during process teardown.
+    # Signal the supervisor and remain alive; on Windows Popen.terminate() maps to
+    # TerminateProcess, which is intentionally the containment boundary here.
+    print(READY_MARKER, flush=True)
+    threading.Event().wait()
 
 
 def supervisor(args: argparse.Namespace) -> int:
@@ -89,18 +93,52 @@ def supervisor(args: argparse.Namespace) -> int:
         "--worker",
     ]
 
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    deadline = time.monotonic() + args.timeout
+    ready = False
+
+    assert process.stdout is not None
     try:
-        completed = subprocess.run(command, timeout=args.timeout, check=False)
-    except subprocess.TimeoutExpired:
-        print(f"Supervisor: FAIL (worker exceeded {args.timeout:g}s and was terminated)")
+        while time.monotonic() < deadline:
+            line = process.stdout.readline()
+            if line:
+                print(line, end="")
+                if READY_MARKER in line:
+                    ready = True
+                    break
+                continue
+
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+
+    if ready:
+        print("WorkerExit: FORCED (expected containment)")
+        print("Supervisor: PASS")
+        return 0
+
+    returncode = process.returncode
+    if returncode is None:
+        print(f"Supervisor: FAIL (worker exceeded {args.timeout:g}s)")
         return 2
 
-    if completed.returncode != 0:
-        print(f"Supervisor: FAIL (worker exit code {completed.returncode})")
-        return completed.returncode
-
-    print("Supervisor: PASS")
-    return 0
+    print(f"Supervisor: FAIL (worker exited before ready marker, code {returncode})")
+    return returncode if returncode != 0 else 3
 
 
 def main() -> int:
