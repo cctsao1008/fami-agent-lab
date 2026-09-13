@@ -6,19 +6,21 @@ The contract deliberately keeps **machine authority in Mesen**, **game interpret
 
 ## Design sources
 
-Three external references informed this contract:
+Four external references informed this contract:
 
 - Alberto-00/Super-Mario-Bros-AI — reinforcement-learning environment design, discrete controller actions, reward shaping, episode metrics, and comparison of Q-learning / SARSA / DQN / DDQN.
 - Thenjiwe Kubheka, “Build an AI Model to Play Super Mario” — simplified discrete action space, grayscale/frame-stack preprocessing, and PPO as a practical baseline.
 - d12/Super-Mario-Neural-Net-AI — emulator/agent separation and hybrid observation using both a compressed game image and Mario X read directly from emulator RAM.
+- amidos2006/Mario-AI-Framework — planning-oriented agent interface, forward model, Mario- or screen-centered observation grids, event history, and gameplay/result metrics.
 
-These are **design references, not backend dependencies**. Fami Pixel does not adopt `gym-super-mario-bros`, `nes-py`, Nintaco, HTTP hooks, or their emulator abstractions. The authoritative backend remains the pinned Mesen CE interop path.
+These are **design references, not backend dependencies**. Fami Pixel does not adopt `gym-super-mario-bros`, `nes-py`, Nintaco, HTTP hooks, or a reimplemented Mario engine as machine authority. The authoritative backend remains the pinned Mesen CE interop path.
 
 References:
 
 - https://github.com/Alberto-00/Super-Mario-Bros-AI
 - https://python.plainenglish.io/build-an-ai-model-to-play-super-mario-7607b1ec1e17
 - https://github.com/d12/Super-Mario-Neural-Net-AI
+- https://github.com/amidos2006/Mario-AI-Framework
 
 ## Authority boundary
 
@@ -74,6 +76,8 @@ This preserves both observation families:
 2. **native framebuffer** for CNN / visual-policy experiments.
 
 A model may consume either projection or both. The environment must not force image inference for state already available authoritatively from RAM.
+
+A future planning-oriented spatial projection may provide a local Mario-centered or screen-centered tile/entity grid. This follows the useful observation-grid pattern in Mario-AI-Framework without adopting its reimplemented game engine as ground truth.
 
 ## Action
 
@@ -162,6 +166,18 @@ terminal state
 ```
 
 This keeps training and evaluation replayable without making the ML framework the source of truth.
+
+## Planning and forward-model boundary
+
+Mario-AI-Framework demonstrates the value of a forward model for planning agents. Fami Pixel may add an optional forward/world model later, but it is prediction only:
+
+```text
+current GameObservation + candidate Action
+→ predicted transition
+→ compare against actual Mesen transition
+```
+
+Mesen remains the ground-truth execution authority. A* / MCTS / model-based RL / LSMM planning may consume the predictive model without redefining machine truth.
 
 ## Baseline policy path
 
