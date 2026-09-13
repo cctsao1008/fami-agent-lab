@@ -62,7 +62,9 @@ Source audit: complete.
 
 Unit-level contract tests: added for `0x08 -> 0x0B` death entry, `0x04 -> 0x05` level-complete entry, and duplicate suppression while a terminal routine remains unchanged.
 
-Machine validation against an actual death and actual 1-1 completion remains required before these terminal events are considered fully machine-validated.
+`DIED`: machine-validated against actual World 1-1 execution.
+
+`LEVEL_COMPLETED`: still requires machine validation against an actual World 1-1 completion path.
 
 ### Death probe attempt 1 — stationary Mario
 
@@ -75,4 +77,26 @@ DeathEdge : FAIL no DIED event within 900 frames; Engine=0x08 X=40
 
 This is a useful negative result: standing at the initial X position does not guarantee an enemy activation/collision path. The event definition itself was not disproved; the stimulus failed to produce a death.
 
-The death probe was therefore revised to hold RIGHT with no jump after game entry, forcing normal World 1-1 execution to advance into a collision/death path while logging engine transitions. No RAM state is fabricated for this validation.
+### Death probe attempt 2 — RIGHT, no jump
+
+The revised machine probe held RIGHT after entering World 1-1 and did not jump. This produced a real collision/death path without fabricated RAM state:
+
+```text
+GameEntry : PASS NativeFrame=196 X=40 Engine=0x08
+DeathDrive: RIGHT held, no jump; waiting for real collision/death
+Progress  : frame=316 drive=120/900 X=189 Engine=0x08
+EngineEdge: frame=387 0x08->0x0B X=295 Y=0xB0 State=1
+DeathEdge : PASS frame=387 Engine=0x0B X=295 Y=0xB0
+Duplicate : PASS no repeated DIED event
+DeathEvent: PASS actual SMB1 execution emitted exactly one DIED edge
+Supervisor: PASS
+```
+
+This establishes the M1 `DIED` event definition as machine-validated for the current SMB1 path:
+
+```text
+previous GameEngineSubroutine != 0x0B
+current  GameEngineSubroutine == 0x0B
+```
+
+The observed authoritative transition was `0x08 -> 0x0B` at native frame 387. The edge-triggered event emitted exactly once, and a 12-frame duplicate-suppression window emitted no additional `DIED` events.
