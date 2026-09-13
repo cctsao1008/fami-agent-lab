@@ -203,14 +203,69 @@ The tail is counterfactual. It never becomes the authoritative episode trajector
 
 The audit is multi-rate rather than continuous. By default it runs every four decisions and is also triggered by no-progress or tied-degraded outcomes. With a 30-frame commit cadence, the periodic audit occurs every 120 committed frames and itself looks 120 frames beyond each candidate macro.
 
+### Machine result: V3 exposes open-loop tail policy mismatch
+
+The V3 machine run was stable through 47 decisions and moved well beyond the V2 failure region, reaching `X=1532`. It also exposed a more important modeling error in the audit itself.
+
+At `X=144`, every root candidate followed by the fixed RIGHT-only tail was predicted to die at `X=295`. That prediction is not useful for root-action ranking, because the real planner later reaches `X=279`, sees that `cruise` is fatal, and selects `tap_jump` successfully. The V3 tail therefore evaluates a future controller that the committed system would not actually use.
+
+The same mismatch appears around the next major hazard:
+
+```text
+Decision 032 frame=1126 X=1068
+  audited medium_jump/long_jump -> +225 over 150 frames
+  planner selects medium_jump
+
+Decision 042 frame=1426 X=1518
+  all audited futures -> only +14 over 150 frames
+
+Decision 043 frame=1456 X=1532
+  all audited futures -> death after 144 frames
+
+Decision 047 frame=1576 X=1532
+  all immediate candidates -> death
+```
+
+So V3 proves that long-horizon audit can reveal delayed consequences, but also that an **open-loop fixed-input tail is the wrong future policy model**. The audit must preserve feedback if it is intended to estimate the future controllability of a root action.
+
+## V4: closed-loop rollout-tail safety audit
+
+`examples/mesen_smb_checkpoint_planner_v4.py` replaces V3's RIGHT-only tail with a bounded closed-loop checkpoint policy.
+
+For each audited root candidate:
+
+```text
+root checkpoint
+  → execute root candidate (30 frames)
+  → tail checkpoint
+      → evaluate cruise / tap / medium / long
+      → commit best tail macro inside counterfactual branch
+  → tail checkpoint
+      → evaluate cruise / tap / medium / long
+      → commit best tail macro inside counterfactual branch
+  → repeat for bounded tail_decisions
+  → score the resulting root candidate future
+```
+
+The default is four tail decisions. An audited root action is therefore evaluated through up to 150 frames total (`30 + 4×30`) while retaining feedback every 30 frames.
+
+This remains model-free and Mesen-grounded. All nested tail transitions are counterfactual. After the four root candidates are ranked, the planner restores the original root checkpoint and commits only the selected first 30-frame macro to the authoritative episode.
+
+The key distinction is:
+
+```text
+V3 audit: root action + open-loop RIGHT tail
+V4 audit: root action + closed-loop checkpoint-policy tail
+```
+
+V4 therefore evaluates future **controllability under the planner's own action vocabulary**, rather than survival under a deliberately crippled fixed continuation.
+
 This deliberately avoids:
 
 - hard-coded World 1-1 X coordinates,
-- exponential `4^N` tree growth,
-- redefining predicted rollouts as machine truth,
-- requiring a learned world model before the environment contract is ready.
-
-The next machine question is whether the periodic rollout audit selects a non-doomed action before the previously observed `X=1226 → X=1266` trap.
+- redefining counterfactual branches as machine truth,
+- requiring a learned world model,
+- full-width exponential search at every committed decision.
 
 ## What this is not
 
