@@ -37,6 +37,13 @@ from .memory import (
     read_nes_cpu_memory,
     read_nes_internal_ram,
 )
+from .video import (
+    NES_FRAME_HEIGHT,
+    NES_FRAME_PIXEL_COUNT,
+    NES_FRAME_WIDTH,
+    NesRawFrame,
+    copy_nes_raw_frame,
+)
 
 __all__ = [
     "CONTROLLER_TYPE_NES_CONTROLLER",
@@ -51,14 +58,19 @@ __all__ = [
     "NES_A",
     "NES_B",
     "NES_DOWN",
+    "NES_FRAME_HEIGHT",
+    "NES_FRAME_PIXEL_COUNT",
+    "NES_FRAME_WIDTH",
     "NES_LEFT",
     "NES_RIGHT",
     "NES_SELECT",
     "NES_START",
     "NES_UP",
     "NesConfig",
+    "NesRawFrame",
     "available_input_overrides",
     "configure_standard_nes_controller",
+    "copy_nes_raw_frame",
     "get_memory_size",
     "get_nes_config",
     "get_nes_controller_state",
