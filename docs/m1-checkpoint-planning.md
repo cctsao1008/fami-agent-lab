@@ -148,13 +148,73 @@ ambiguous/degraded state
   → commit only the selected first action
 ```
 
-This preserves the receding-horizon architecture and Mesen authority while giving the planner enough lookahead to distinguish equal immediate-X outcomes with different future consequences.
+This preserves the receding-horizon architecture and Mesen authority while giving the planner additional lookahead.
 
-The trigger is data-derived rather than coordinate-derived: the planner tracks the best safe 30-frame progress already observed (`nominal_progress`). Two-ply search is used when the best immediate outcome is tied yet below that nominal capability, or when all immediate progress is non-positive.
+### Machine result: V2 still fails on delayed consequences
+
+The corrected V2 machine run reached the same critical region cleanly and removed the frame-step regression from consideration. It proved that two-ply search itself works, but that 60 frames are still too short for this failure mode.
+
+Key machine evidence:
+
+```text
+Decision 029 frame=1036 X=1226
+  one-ply: all candidates dx=40
+  two-ply: all first actions score=0.667, best continuation dx2=0
+  selected cruise
+
+Decision 030..033 X=1266
+  all immediate candidates dx=0
+  all two-ply branches remain non-terminal with zero progress
+
+Decision 034 X=1266
+  second-ply continuations finally see death
+
+Decision 035 X=1266
+  every first-ply candidate is death
+```
+
+The important result is that `DIED` arrives substantially later than the state first becomes unrecoverable. A terminal-only 30- or 60-frame evaluator can therefore enter a doomed trajectory while all visible short-horizon scores are still tied.
+
+This is not evidence that checkpoint search is wrong; it is evidence that a fixed shallow horizon is the wrong abstraction for delayed terminal consequences.
+
+## V3: multi-rate rollout-tail safety audit
+
+`examples/mesen_smb_checkpoint_planner_v3.py` keeps the 30-frame committed control cadence but adds a slower bounded future rollout audit.
+
+```text
+fast loop
+  checkpoint
+  → evaluate four 30-frame action macros
+  → normally commit one macro
+
+safety audit
+  checkpoint
+  → candidate macro (30 frames)
+  → fixed RIGHT-only rollout tail (default 120 frames)
+  → observe delayed death / flagpole / future progress
+  → restore checkpoint
+  → repeat for each candidate
+  → commit only the selected first 30-frame macro
+```
+
+The tail is counterfactual. It never becomes the authoritative episode trajectory. Its purpose is to ask a narrower planning question:
+
+> If this first action is chosen, does a simple continuation expose a delayed terminal consequence that the immediate horizon cannot see?
+
+The audit is multi-rate rather than continuous. By default it runs every four decisions and is also triggered by no-progress or tied-degraded outcomes. With a 30-frame commit cadence, the periodic audit occurs every 120 committed frames and itself looks 120 frames beyond each candidate macro.
+
+This deliberately avoids:
+
+- hard-coded World 1-1 X coordinates,
+- exponential `4^N` tree growth,
+- redefining predicted rollouts as machine truth,
+- requiring a learned world model before the environment contract is ready.
+
+The next machine question is whether the periodic rollout audit selects a non-doomed action before the previously observed `X=1226 → X=1266` trap.
 
 ## What this is not
 
-This planner is not A*, MCTS, PPO, DQN, or a learned world model. It is the minimum real checkpoint-search mechanism needed before those consumers can be evaluated cleanly.
+These planners are not A*, MCTS, PPO, DQN, or a learned world model. They are the minimum real checkpoint-search mechanisms needed before those consumers can be evaluated cleanly.
 
 Future planners may replace the ranking/search strategy while retaining the same architecture:
 
