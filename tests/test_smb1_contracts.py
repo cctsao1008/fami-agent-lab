@@ -31,13 +31,20 @@ def _state() -> Smb1State:
     )
 
 
-def _observation(frame_id: int, *, x: int, state: int, y: int = 0xB0):
+def _observation(
+    frame_id: int,
+    *,
+    x: int,
+    state: int,
+    y: int = 0xB0,
+    engine: int = 0x08,
+):
     source = _state()
     source = Smb1State(
         frame_counter=source.frame_counter,
         oper_mode=source.oper_mode,
         oper_mode_task=source.oper_mode_task,
-        game_engine_subroutine=source.game_engine_subroutine,
+        game_engine_subroutine=engine,
         world=source.world,
         level=source.level,
         player_page=(x >> 8) & 0xFF,
@@ -108,6 +115,31 @@ def test_events_derive_landing() -> None:
         GameEventType.MOVED,
         GameEventType.LANDED,
     ]
+
+
+def test_events_derive_death_on_player_death_routine_entry() -> None:
+    previous = _observation(300, x=140, state=0, engine=0x08)
+    current = _observation(301, x=140, state=0, engine=0x0B)
+
+    events = derive_game_events(previous, current)
+
+    assert [event.kind for event in events] == [GameEventType.DIED]
+
+
+def test_events_derive_level_complete_on_player_end_level_entry() -> None:
+    previous = _observation(400, x=3000, state=3, engine=0x04)
+    current = _observation(401, x=3000, state=3, engine=0x05)
+
+    events = derive_game_events(previous, current)
+
+    assert [event.kind for event in events] == [GameEventType.LEVEL_COMPLETED]
+
+
+def test_terminal_events_do_not_repeat_while_routine_is_unchanged() -> None:
+    previous = _observation(500, x=140, state=0, engine=0x0B)
+    current = _observation(501, x=140, state=0, engine=0x0B)
+
+    assert derive_game_events(previous, current) == ()
 
 
 def test_events_reject_nonmonotonic_frames() -> None:
