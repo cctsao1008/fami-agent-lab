@@ -1,4 +1,4 @@
-# Fami Agent Lab 🎮🌱
+# Fami Pixel
 
 A tiny machine-learning playground for Famicom / NES games.
 
@@ -10,41 +10,32 @@ The first workload is **Super Mario Bros.** running on **Mesen CE**. The project
 
 - Windows
 - Mesen CE
-- Super Mario Bros.
 - Python
-- Direct `MesenCore.dll` interop
-- Native framebuffer observation
-- RAM / PPU structured observation
-- Direct controller input override
-- Deterministic, frame-aligned stepping
-
-No Lua. No screen scraping in the target architecture. No virtual gamepad in the target architecture.
+- Native framebuffer access
+- RAM / PPU observation
+- Direct controller input
+- Deterministic frame stepping
 
 ## Architecture
 
 ```text
-                     Python Agent
-                          │
-              ┌───────────┴───────────┐
-              │                       │
-              ▼                       ▼
-        Observation                 Action
-              │                       │
-      ┌───────┴────────┐              │
-      │                │              │
-      ▼                ▼              ▼
-Native framebuffer  RAM / PPU   Input override
-      │                │              │
-      └────────────┬───┴──────────────┘
-                   ▼
-              MesenCore.dll
-                   │
-                   ▼
-                 NES / FC
-                   │
-                   ▼
-             Super Mario Bros.
+Python / ML
+   │
+   ├── observation
+   │      ├── native framebuffer
+   │      └── RAM / PPU state
+   │
+   └── action
+          └── controller input
+                 │
+                 ▼
+              Mesen CE
+                 │
+                 ▼
+            Famicom / NES
 ```
+
+The emulator remains the authority for machine state. Python provides the experimentation layer above a small native adapter boundary.
 
 ## Research modes
 
