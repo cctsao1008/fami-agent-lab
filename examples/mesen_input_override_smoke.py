@@ -9,6 +9,7 @@ probe proves command delivery and bounded stepping, not Mario movement yet.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import subprocess
 import sys
 import threading
@@ -82,7 +83,7 @@ def worker(args: argparse.Namespace) -> None:
 
     config = configure_standard_nes_controller(core, port=1)
     print(
-        f"NesConfig : PASS (sizeof={type(config).__sizeof__(config)} Port1.Type={config.Port1.Type} AutoConfigureInput={bool(config.AutoConfigureInput)})",
+        f"NesConfig : PASS (sizeof={ctypes.sizeof(config)} Port1.Type={config.Port1.Type} AutoConfigureInput={bool(config.AutoConfigureInput)})",
         flush=True,
     )
 
