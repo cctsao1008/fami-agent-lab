@@ -64,6 +64,7 @@ Write-Host "Solution   : $Solution"
 Write-Host "Target     : InteropDLL"
 Write-Host "Config     : $Configuration|$Platform"
 Write-Host "Encoding   : UTF-8 (/utf-8)"
+Write-Host "Build mode : clean + build"
 Write-Host
 
 # Build through Mesen.sln rather than invoking InteropDLL.vcxproj directly.
@@ -76,6 +77,11 @@ Write-Host
 # Mesen treats warnings as errors, which promotes that warning to C2220 and
 # stops the build. Inject /utf-8 through the documented CL environment variable
 # for this child build only, without modifying the upstream submodule.
+#
+# Because the compiler encoding switches are part of the precompiled-header
+# compatibility contract, switching from the default code page to /utf-8 while
+# reusing old PCH/object files produces C2855. Always clean the InteropDLL target
+# and its dependencies before rebuilding with the injected encoding option.
 $OriginalCL = [Environment]::GetEnvironmentVariable("CL", "Process")
 try {
     $env:CL = if ([string]::IsNullOrWhiteSpace($OriginalCL)) {
@@ -84,6 +90,21 @@ try {
         "/utf-8 $OriginalCL"
     }
 
+    Write-Host "Cleaning Mesen InteropDLL and dependencies..."
+    & $MSBuild $Solution `
+        /m `
+        /nologo `
+        /verbosity:minimal `
+        /t:InteropDLL:Clean `
+        "/p:Configuration=$Configuration" `
+        "/p:Platform=$Platform"
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Mesen InteropDLL clean failed with exit code $LASTEXITCODE."
+    }
+
+    Write-Host
+    Write-Host "Building Mesen InteropDLL..."
     & $MSBuild $Solution `
         /m `
         /nologo `
