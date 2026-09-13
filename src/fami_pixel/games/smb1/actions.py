@@ -18,6 +18,7 @@ class Smb1Action(str, Enum):
     RIGHT = "RIGHT"
     RIGHT_A = "RIGHT_A"
     LEFT = "LEFT"
+    LEFT_A = "LEFT_A"
     A = "A"
 
 
@@ -26,6 +27,7 @@ _ACTION_TO_BUTTONS: dict[Smb1Action, int] = {
     Smb1Action.RIGHT: NES_RIGHT,
     Smb1Action.RIGHT_A: NES_RIGHT | NES_A,
     Smb1Action.LEFT: NES_LEFT,
+    Smb1Action.LEFT_A: NES_LEFT | NES_A,
     Smb1Action.A: NES_A,
 }
 
