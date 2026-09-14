@@ -61,6 +61,7 @@ LIVE_CANDIDATE_NAMES = (
 )
 _TERMINAL_PREFIX = "PlannerV11:"
 _SUPERVISOR_GRACE_S = 0.75
+_IPC_REPLACE_ATTEMPTS = 4
 
 
 def _timestamp() -> str:
@@ -101,11 +102,43 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _atomic_json(path: Path, payload: dict) -> None:
+def _atomic_json(path: Path, payload: dict) -> bool:
+    """Publish latest-value IPC without letting Windows sharing races stop authority.
+
+    On Windows a reader can briefly hold the destination JSON open, causing
+    ``os.replace`` to fail with WinError 5/32.  V11 is a latest-value protocol:
+    a missed snapshot/result is preferable to blocking or killing the live plant.
+    Use a unique temp file, retry only for a few milliseconds, then drop this
+    publication and let the next generation supersede it.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    os.replace(tmp, path)
+    encoded = json.dumps(payload, separators=(",", ":"))
+
+    for attempt in range(_IPC_REPLACE_ATTEMPTS):
+        tmp = path.with_name(
+            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        try:
+            tmp.write_text(encoded, encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except PermissionError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            if attempt + 1 < _IPC_REPLACE_ATTEMPTS:
+                time.sleep(0.001 * (2**attempt))
+                continue
+            return False
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+    return False
 
 
 def _read_json(path: Path) -> dict | None:
@@ -422,7 +455,7 @@ def authority_main(args: argparse.Namespace) -> int:
                 generation += 1
                 checkpoint = checkpoint_dir / f"live-{generation:06d}.mss"
                 frame, x, engine = base.save_checkpoint(core, checkpoint)
-                _atomic_json(
+                published = _atomic_json(
                     request_path,
                     {
                         "generation": generation,
@@ -432,6 +465,11 @@ def authority_main(args: argparse.Namespace) -> int:
                         "engine": engine,
                     },
                 )
+                if not published:
+                    _log(
+                        f"IPC backpressure: dropped planner snapshot generation={generation} "
+                        "after transient Windows sharing conflicts"
+                    )
 
                 keep = max(6, (args.plan_freshness // args.control_quantum) + 6)
                 obsolete_generation = generation - keep
