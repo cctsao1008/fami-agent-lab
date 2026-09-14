@@ -30,7 +30,7 @@ def test_best_fresh_plan_prefers_newest_root_then_score(tmp_path):
             "generation": 2,
             "root_frame": 100,
             "candidate": "run_long_jump",
-            "buttons": 1,
+            "schedule": [{"buttons": 1, "frames": 24}, {"buttons": 2, "frames": 6}],
             "score": [1, 0, 90, 190],
         },
     )
@@ -40,7 +40,7 @@ def test_best_fresh_plan_prefers_newest_root_then_score(tmp_path):
             "generation": 3,
             "root_frame": 104,
             "candidate": "run",
-            "buttons": 2,
+            "schedule": [{"buttons": 2, "frames": 30}],
             "score": [1, 0, 40, 144],
         },
     )
@@ -59,7 +59,7 @@ def test_best_fresh_plan_rejects_stale_and_already_applied(tmp_path):
             "generation": 2,
             "root_frame": 90,
             "candidate": "run",
-            "buttons": 1,
+            "schedule": [{"buttons": 1, "frames": 30}],
             "score": [1, 0, 50, 140],
         },
     )
@@ -69,7 +69,7 @@ def test_best_fresh_plan_rejects_stale_and_already_applied(tmp_path):
             "generation": 3,
             "root_frame": 104,
             "candidate": "tap_jump",
-            "buttons": 2,
+            "schedule": [{"buttons": 2, "frames": 6}, {"buttons": 3, "frames": 24}],
             "score": [1, 0, 30, 134],
         },
     )
@@ -80,3 +80,15 @@ def test_best_fresh_plan_rejects_stale_and_already_applied(tmp_path):
         freshness=8,
         last_applied_generation=3,
     ) is None
+
+
+def test_schedule_buttons_tracks_multi_command_macro():
+    schedule = [
+        {"buttons": 0x83, "frames": 6},
+        {"buttons": 0x82, "frames": 24},
+    ]
+    assert v11._schedule_buttons(schedule, 0) == 0x83
+    assert v11._schedule_buttons(schedule, 5) == 0x83
+    assert v11._schedule_buttons(schedule, 6) == 0x82
+    assert v11._schedule_buttons(schedule, 29) == 0x82
+    assert v11._schedule_buttons(schedule, 40) == 0x82
