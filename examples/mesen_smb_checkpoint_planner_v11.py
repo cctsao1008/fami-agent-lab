@@ -7,8 +7,9 @@ V11 changes the execution model from stop-plan-commit to continuous authority:
 - multiple shadow Mesen processes evaluate the newest checkpoint in parallel,
 - stale plans are discarded instead of stalling Mario.
 
-V10 remains the synchronous research oracle for rollout semantics. Mesen A is
-machine truth; every shadow instance is prediction-only.
+The live planner deliberately uses short 8-12 frame probes. Longer V10-style
+30-frame rollouts remain useful as an offline/synchronous oracle, but cannot meet
+a 4-frame control deadline when native stepping is close to real time.
 """
 
 from __future__ import annotations
@@ -22,7 +23,13 @@ import subprocess
 import sys
 import time
 
-from fami_pixel.adapters.mesen import MesenCore, NES_B, NES_RIGHT, configure_standard_nes_controller
+from fami_pixel.adapters.mesen import (
+    MesenCore,
+    NES_A,
+    NES_B,
+    NES_RIGHT,
+    configure_standard_nes_controller,
+)
 from fami_pixel.games.smb1 import (
     CandidateTerminal,
     GameEventType,
@@ -38,10 +45,22 @@ import mesen_smb_checkpoint_planner_v10 as v10
 
 
 CONTROL_QUANTUM = 4
-PLAN_FRESHNESS_FRAMES = 8
+PLAN_FRESHNESS_FRAMES = 16
 UI_STRIDE = 2
 DEFAULT_SHADOW_WORKERS = 4
 BOOTSTRAP_BUTTONS = NES_RIGHT | NES_B
+BOOTSTRAP_SCHEDULE = (
+    {"buttons": NES_RIGHT | NES_A | NES_B, "frames": 8},
+    {"buttons": NES_RIGHT | NES_B, "frames": 8},
+)
+LIVE_CANDIDATE_NAMES = (
+    "right_b_8",
+    "right_a_b_8",
+    "right_a_b_12",
+    "right_8",
+)
+_TERMINAL_PREFIX = "PlannerV11:"
+_SUPERVISOR_GRACE_S = 0.75
 
 
 def _timestamp() -> str:
@@ -66,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--control-quantum", type=int, default=CONTROL_QUANTUM)
     p.add_argument("--plan-freshness", type=int, default=PLAN_FRESHNESS_FRAMES)
     p.add_argument("--shadow-workers", type=int, default=DEFAULT_SHADOW_WORKERS)
+    p.add_argument("--authority-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--shadow-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--worker-index", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
@@ -96,7 +116,8 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _candidate_pool():
-    return tuple(v7.COARSE_CANDIDATES)
+    by_name = {candidate.name: candidate for candidate in v7.PRECISION_CANDIDATES}
+    return tuple(by_name[name] for name in LIVE_CANDIDATE_NAMES)
 
 
 def _candidate_shard(worker_index: int, worker_count: int):
@@ -165,10 +186,6 @@ def shadow_worker_main(args: argparse.Namespace) -> int:
 
         try:
             for candidate in candidates:
-                newest = _read_json(args.request)
-                if newest is not None and int(newest.get("generation", generation)) > generation:
-                    break
-
                 base.restore_checkpoint(core, checkpoint, root_frame, root_x, root_engine)
                 start = observation_from_state(core.frame_count(), read_smb1_state(core))
                 outcome = v10.run_candidate_pit_aware(core, candidate, start, args.step_timeout)
@@ -222,7 +239,13 @@ def _spawn_shadow_workers(args: argparse.Namespace, request_path: Path, response
             "--request", str(request_path),
             "--response", str(response_path),
         ]
-        workers.append(subprocess.Popen(cmd))
+        workers.append(
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        )
     return workers
 
 
@@ -244,14 +267,51 @@ def _best_fresh_plan(response_paths: list[Path], current_frame: int, freshness: 
     return max(plans, key=lambda p: (int(p["root_frame"]), tuple(p.get("score", []))))
 
 
-def _schedule_buttons(schedule: list[dict], elapsed_frames: int) -> int:
+def _schedule_buttons(schedule: list[dict] | tuple[dict, ...], elapsed_frames: int, *, repeat: bool = False) -> int:
+    if not schedule:
+        return BOOTSTRAP_BUTTONS
+    total = sum(int(segment["frames"]) for segment in schedule)
     remaining = max(0, int(elapsed_frames))
+    if repeat and total > 0:
+        remaining %= total
     for segment in schedule:
         frames = int(segment["frames"])
         if remaining < frames:
             return int(segment["buttons"])
         remaining -= frames
-    return int(schedule[-1]["buttons"]) if schedule else BOOTSTRAP_BUTTONS
+    return int(schedule[-1]["buttons"])
+
+
+def _terminal_code(line: str) -> int | None:
+    if not line.strip().startswith(_TERMINAL_PREFIX):
+        return None
+    if "PASS" in line:
+        return 0
+    if "FAIL death" in line:
+        return 6
+    if "FAIL frame limit" in line:
+        return 7
+    if "FAIL" in line:
+        return 1
+    return None
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def authority_main(args: argparse.Namespace) -> int:
@@ -287,12 +347,13 @@ def authority_main(args: argparse.Namespace) -> int:
 
     _log(
         f"Planner V11: continuous authority + {args.shadow_workers} parallel shadow workers; "
-        f"control={args.control_quantum}f freshness={args.plan_freshness}f"
+        f"control={args.control_quantum}f freshness={args.plan_freshness}f live-horizon=8..12f"
     )
 
-    applied_schedule = [{"buttons": BOOTSTRAP_BUTTONS, "frames": args.max_frames}]
-    applied_label = "BOOTSTRAP RIGHT+B"
+    applied_schedule: list[dict] | tuple[dict, ...] = BOOTSTRAP_SCHEDULE
+    applied_label = "BOOTSTRAP PULSE-JUMP"
     applied_plan_root = current.native_frame_id
+    using_bootstrap = True
     generation = 0
     last_applied_generation = -1
     last_plan_root = -1
@@ -302,7 +363,11 @@ def authority_main(args: argparse.Namespace) -> int:
     try:
         for loop_index in range(args.max_frames):
             schedule_age = max(0, current.native_frame_id - applied_plan_root)
-            applied_buttons = _schedule_buttons(applied_schedule, schedule_age)
+            applied_buttons = _schedule_buttons(
+                applied_schedule,
+                schedule_age,
+                repeat=using_bootstrap,
+            )
 
             base.set_nes_controller_state(core, 0, applied_buttons)
             base.step(core, args.step_timeout)
@@ -343,6 +408,7 @@ def authority_main(args: argparse.Namespace) -> int:
                     applied_schedule = list(plan.get("schedule") or [])
                     applied_label = _schedule_label(str(plan["candidate"]))
                     applied_plan_root = int(plan["root_frame"])
+                    using_bootstrap = False
                     last_applied_generation = int(plan["generation"])
                     last_plan_root = applied_plan_root
                     last_plan_age = int(plan["age"])
@@ -367,7 +433,7 @@ def authority_main(args: argparse.Namespace) -> int:
                     },
                 )
 
-                keep = max(4, (args.plan_freshness // args.control_quantum) + 4)
+                keep = max(6, (args.plan_freshness // args.control_quantum) + 6)
                 obsolete_generation = generation - keep
                 if obsolete_generation > 0:
                     try:
@@ -380,24 +446,66 @@ def authority_main(args: argparse.Namespace) -> int:
         _log(f"PlannerV11: FAIL frame limit | frame={current.native_frame_id} X={current.mario_x_abs}")
         return 7
     finally:
-        base.set_nes_controller_state(core, 0, 0x00)
-        if viewer is not None:
-            viewer.stop()
+        # Do not let teardown correctness hide the terminal result. The outer
+        # supervisor also owns a process-tree kill as the final Windows guard.
         for worker in workers:
             if worker.poll() is None:
                 worker.terminate()
         for worker in workers:
             try:
-                worker.wait(timeout=2.0)
+                worker.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 worker.kill()
+        try:
+            base.set_nes_controller_state(core, 0, 0x00)
+        except Exception:
+            pass
+        if viewer is not None:
+            try:
+                viewer.stop()
+            except Exception:
+                pass
+
+
+def supervise_main() -> int:
+    cmd = [
+        sys.executable,
+        "-u",
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+        "--authority-worker",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    for line in iter(proc.stdout.readline, ""):
+        print(line, end="", flush=True)
+        code = _terminal_code(line[line.find("PlannerV11:"):] if "PlannerV11:" in line else line)
+        if code is None:
+            continue
+        try:
+            proc.wait(timeout=_SUPERVISOR_GRACE_S)
+        except subprocess.TimeoutExpired:
+            _log("V11 supervisor: terminal result observed; terminating authority + shadow process tree")
+            _terminate_process_tree(proc)
+        return code
+
+    return proc.wait()
 
 
 def main() -> int:
     args = parse_args()
     if args.shadow_worker:
         return shadow_worker_main(args)
-    return authority_main(args)
+    if args.authority_worker:
+        return authority_main(args)
+    return supervise_main()
 
 
 if __name__ == "__main__":
