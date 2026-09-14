@@ -7,6 +7,11 @@ planner keeps committing tiny RIGHT+A+B actions without creating enough jump
 height or run-up distance. V9 keeps the V8 fast path and probes a tiny set of
 long-horizon recovery macros first when V8 reports ``no-forward-progress``.
 
+V9 also guards authoritative execution against a visibly unrecoverable pit fall.
+The guard does not redefine the durable DIED event: once Mario is below the
+playable floor envelope and still descending, planning stops and controls are
+released while Mesen advances until the source-audited DIED engine edge appears.
+
 Mesen remains the machine authority. Recovery candidates are counterfactual
 save-state rollouts; only the selected root candidate is committed.
 """
@@ -21,7 +26,16 @@ import sys
 import threading
 import time
 
-from fami_pixel.games.smb1 import ActionCommand, CandidateTerminal, PlanCandidate, Smb1Action
+from fami_pixel.games.smb1 import (
+    ActionCommand,
+    CandidateTerminal,
+    GameEventType,
+    PlanCandidate,
+    Smb1Action,
+    derive_game_events,
+    observation_from_state,
+    read_smb1_state,
+)
 
 import mesen_smb_checkpoint_planner_v6 as v6
 import mesen_smb_checkpoint_planner_v7 as v7
@@ -55,6 +69,8 @@ RECOVERY_CANDIDATES = (
 )
 
 RECOVERY_NAMES = frozenset(c.name for c in RECOVERY_CANDIDATES)
+PIT_FALL_Y = 208
+PIT_DRAIN_MAX_FRAMES = 120
 _WORKER_ENV = "FAMI_PIXEL_V9_WORKER"
 _RESULT_PREFIX = "PlannerV7:"
 _NO_OUTPUT_TIMEOUT_S = 180.0
@@ -62,6 +78,8 @@ _POST_RESULT_GRACE_S = 1.0
 
 _original_v8_evaluate = v8.evaluate_candidates
 _original_v8_beam = v8.beam_search
+_original_v8_observed_commit = v8._observed_commit_candidate
+_original_v7_commit = v7.commit_candidate
 
 
 for _candidate, _label in zip(
@@ -80,6 +98,88 @@ def _timestamp() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+def _signed_byte(value: int) -> int:
+    return value - 256 if value >= 128 else value
+
+
+def _is_unrecoverable_pit_fall(observation) -> bool:
+    return (
+        observation.game_engine_subroutine == v8.base.PLAYER_CONTROL
+        and observation.mario_y >= PIT_FALL_Y
+        and _signed_byte(observation.player_y_speed) > 0
+    )
+
+
+def _drain_to_authoritative_death(core, current, episode, timeout_s):
+    """Stop planning and let Mesen reach its real DIED edge after a doomed fall."""
+    print(
+        f"V9 fall guard: unrecoverable pit fall at frame={current.native_frame_id} "
+        f"X={current.mario_x_abs} Y={current.mario_y} "
+        f"VY={_signed_byte(current.player_y_speed):+d}; planning stopped",
+        flush=True,
+    )
+    v8.base.set_nes_controller_state(core, 0, 0x00)
+    previous = current
+
+    for drain_index in range(1, PIT_DRAIN_MAX_FRAMES + 1):
+        v8.base.step(core, timeout_s)
+        state = read_smb1_state(core)
+        current = observation_from_state(core.frame_count(), state)
+        events = derive_game_events(previous, current)
+        episode.record(current, events)
+        died = any(event.kind == GameEventType.DIED for event in events)
+
+        if v8._web_viewer is not None and (
+            drain_index % max(1, v8._web_sample_stride) == 0 or died
+        ):
+            v8._web_viewer.publish_core(
+                core,
+                current,
+                decision=v8._commit_decision,
+                mode="PIT-FALL TERMINAL",
+                action="controls released",
+            )
+
+        if died:
+            print(
+                f"V9 fall guard: authoritative DIED edge confirmed "
+                f"frame={current.native_frame_id} engine=0x{current.game_engine_subroutine:02X}",
+                flush=True,
+            )
+            return current, CandidateTerminal.DEATH
+        previous = current
+
+    print(
+        f"V9 fall guard: no DIED edge within {PIT_DRAIN_MAX_FRAMES} frames; "
+        "terminating doomed trajectory without further planning",
+        flush=True,
+    )
+    return previous, CandidateTerminal.DEATH
+
+
+def _guard_commit_result(core, result, episode, timeout_s):
+    current, terminal, reached_flagpole = result
+    if terminal == CandidateTerminal.NONE and _is_unrecoverable_pit_fall(current):
+        current, terminal = _drain_to_authoritative_death(
+            core, current, episode, timeout_s
+        )
+    return current, terminal, reached_flagpole
+
+
+def _guarded_observed_commit(core, candidate, start_observation, episode, timeout_s):
+    result = _original_v8_observed_commit(
+        core, candidate, start_observation, episode, timeout_s
+    )
+    return _guard_commit_result(core, result, episode, timeout_s)
+
+
+def _guarded_headless_commit(core, candidate, start_observation, episode, timeout_s):
+    result = _original_v7_commit(
+        core, candidate, start_observation, episode, timeout_s
+    )
+    return _guard_commit_result(core, result, episode, timeout_s)
+
+
 def _evaluate_only(args, kwargs, candidates):
     local_args = list(args)
     local_args[1] = tuple(candidates)
@@ -87,12 +187,7 @@ def _evaluate_only(args, kwargs, candidates):
 
 
 def evaluate_candidates(*args, **kwargs):
-    """Probe only the three recovery macros first on a no-progress state.
-
-    If one proves safe forward progress, return those recovery outcomes directly
-    and skip the 27 short precision probes entirely. Only if recovery fails do we
-    fall back to the original short precision search.
-    """
+    """Probe only the three recovery macros first on a no-progress state."""
     mode = kwargs.get("mode")
     if (
         not v8._full_search
@@ -159,7 +254,12 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
 def main() -> int:
     v8.evaluate_candidates = evaluate_candidates
     v8.beam_search = beam_search
-    print("Planner V9: obstacle recovery enabled for no-forward-progress states", flush=True)
+    v8._observed_commit_candidate = _guarded_observed_commit
+    v7.commit_candidate = _guarded_headless_commit
+    print(
+        "Planner V9: obstacle recovery + authoritative pit-fall terminal guard enabled",
+        flush=True,
+    )
     return v8.main()
 
 
@@ -222,6 +322,7 @@ def _compact(line: str) -> bool:
         "V8 branch governor:",
         "V9 recovery probe:",
         "V9 stuck recovery:",
+        "V9 fall guard:",
         "Beam choice:",
         "Selected action:",
         "Decision mode",
