@@ -15,6 +15,9 @@ Mesen remains machine authority; only the chosen root action is committed.
 
 from __future__ import annotations
 
+import os
+import sys
+
 from fami_pixel.games.smb1 import CandidateTerminal, score_candidate
 
 import mesen_smb_checkpoint_planner_v6 as v6
@@ -145,5 +148,20 @@ def main() -> int:
     return v7.main()
 
 
+def _cli() -> None:
+    """Run the planner and return control to the shell even if Mesen teardown stalls.
+
+    The planner's result is fully determined before this point. Mesen's native
+    runtime can keep Python alive during interpreter/DLL teardown after a clean
+    result, so the CLI deliberately bypasses process finalizers once stdout and
+    stderr have been flushed. This does not change planner execution or search
+    semantics; it only bounds post-result shutdown.
+    """
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _cli()
