@@ -98,32 +98,39 @@ Do not manually move the Mesen submodule to another commit unless the main repos
 
 ## 4. Create the Python environment
 
-From the repository root:
+From the repository root, use the repository-owned bootstrap script:
 
 ```powershell
-py -m venv .venv
+.\tools\setup_python_env.ps1
+```
+
+The script:
+
+```text
+checks Python >= 3.11
+creates .venv when missing
+upgrades pip/setuptools
+installs fami-pixel in editable mode
+installs the declared test dependency extra
+verifies import fami_pixel
+verifies pytest availability
+```
+
+Python test dependencies are declared in `pyproject.toml` under the `test` optional dependency group. The bootstrap script does not hard-code individual test packages.
+
+Activate the environment in the current PowerShell when desired:
+
+```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-Upgrade packaging tools:
+Activation is intentionally separate because a child PowerShell script cannot persist environment changes into its parent shell.
+
+You can also use the virtual-environment interpreter directly without activation:
 
 ```powershell
-python -m pip install --upgrade pip setuptools
+.\.venv\Scripts\python.exe -m pytest -q
 ```
-
-Install fami-pixel in editable mode:
-
-```powershell
-python -m pip install -e .
-```
-
-Install pytest:
-
-```powershell
-python -m pip install pytest
-```
-
-The project itself currently has no external runtime Python dependencies beyond the standard library.
 
 ## 5. Build the fami-pixel Mesen CE Interop DLL
 
@@ -185,8 +192,16 @@ Do not substitute a stock upstream Mesen CE DLL that lacks the fami-pixel intero
 
 ## 7. Run the Python test suite
 
+With the virtual environment activated:
+
 ```powershell
-py -m pytest -q
+python -m pytest -q
+```
+
+Or without activation:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
 Current known-good baseline as of 2026-09-14:
@@ -269,6 +284,7 @@ The regression ZIP is a local research artifact and is not required for a fresh 
 
 ```text
 fami-pixel\
+├─ .venv\
 ├─ build\
 │  ├─ mesen\
 │  │  └─ MesenCore.dll
@@ -283,7 +299,7 @@ fami-pixel\
 └─ tools\
 ```
 
-`build\` contents are generated machine artifacts and should not be treated as source-of-truth code.
+`.venv\` and `build\` are local generated artifacts and are ignored by Git.
 
 ## 12. Fast setup checklist
 
@@ -293,16 +309,12 @@ For a clean machine, the core sequence is:
 git clone --recurse-submodules https://github.com/cctsao1008/fami-pixel.git
 cd fami-pixel
 
-py -m venv .venv
+.\tools\setup_python_env.ps1
 .\.venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip setuptools
-python -m pip install -e .
-python -m pip install pytest
 
 .\tools\build_mesen.ps1
 
-py -m pytest -q
+python -m pytest -q
 ```
 
 Then run a Mesen-based example with the local ROM path.
@@ -340,11 +352,25 @@ Expected output:
 build\mesen\MesenCore.dll
 ```
 
-### Python cannot import `fami_pixel`
+### Python cannot import `fami_pixel` or pytest is missing
+
+Re-run the repository bootstrap:
+
+```powershell
+.\tools\setup_python_env.ps1
+```
+
+Then either activate the environment:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e .
+```
+
+or invoke its Python directly:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import fami_pixel"
+.\.venv\Scripts\python.exe -m pytest --version
 ```
 
 ### Submodule appears wrong or incomplete
