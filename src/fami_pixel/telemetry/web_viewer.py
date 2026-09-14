@@ -83,24 +83,54 @@ _HTML = r"""<!doctype html>
 <title>Fami Pixel Live</title>
 <style>
 :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+* { box-sizing: border-box; }
 body { margin: 0; background: #111; color: #eee; }
-main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(260px, 1fr); gap: 18px; padding: 18px; }
+main {
+  width: min(100% - 32px, 1160px);
+  margin: 24px auto;
+  display: grid;
+  grid-template-columns: minmax(0, 768px) 320px;
+  align-items: start;
+  justify-content: center;
+  gap: 18px;
+}
 .card { background: #1b1b1b; border: 1px solid #333; border-radius: 12px; padding: 14px; }
-#frame { width: 100%; image-rendering: pixelated; aspect-ratio: 256 / 240; background: #000; display: block; }
-h1 { margin: 0 0 12px; font-size: 20px; }
+.game-card { width: 100%; }
+#frame-wrap {
+  width: min(100%, 768px);
+  aspect-ratio: 256 / 240;
+  margin: 0 auto;
+  background: #000;
+  overflow: hidden;
+}
+#frame {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
+  display: block;
+}
+h1 { margin: 0 0 12px; font-size: 18px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
 .k { color: #999; }
 .v { text-align: right; }
 #action { font-size: 18px; margin: 8px 0 14px; }
 #status { margin-top: 12px; color: #aaa; font-size: 12px; }
-@media (max-width: 850px) { main { grid-template-columns: 1fr; } }
+@media (max-width: 1120px) {
+  main { grid-template-columns: minmax(0, 640px) 300px; }
+}
+@media (max-width: 850px) {
+  main { width: min(100% - 20px, 640px); grid-template-columns: 1fr; margin: 10px auto; }
+}
 </style>
 </head>
 <body>
 <main>
-  <section class="card">
+  <section class="card game-card">
     <h1>Fami Pixel / SMB1 — authoritative trajectory</h1>
-    <img id="frame" alt="NES authoritative framebuffer">
+    <div id="frame-wrap">
+      <img id="frame" alt="NES authoritative framebuffer">
+    </div>
   </section>
   <aside class="card">
     <div class="k">Committed action</div>
