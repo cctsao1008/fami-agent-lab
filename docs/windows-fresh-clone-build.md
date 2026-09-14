@@ -15,7 +15,14 @@ modules/mesen
 → https://github.com/cctsao1008/MesenCE.git
 ```
 
-The intended environment is **Windows + Python 3.11+ + Visual Studio C++ build tools**.
+The intended environment is **Windows + Python 3.11+** plus either:
+
+```text
+A. Visual Studio / Visual Studio Build Tools with C++ support
+B. a portable vsget MSVC + MSBuild + Windows SDK tree
+```
+
+The Visual Studio path remains the normal installed-toolchain path. The portable path is for machines where a full Visual Studio installation is undesirable.
 
 ## 1. Prerequisites
 
@@ -39,7 +46,9 @@ The project currently declares:
 Python >= 3.11
 ```
 
-### Visual Studio with Desktop C++ workload
+### Native build toolchain — choose one
+
+#### Option A — Visual Studio / Build Tools
 
 Install Visual Studio 2022/2026 or the corresponding Build Tools with:
 
@@ -51,6 +60,31 @@ Windows SDK
 ```
 
 The repository build script automatically tries to locate `MSBuild.exe` from `PATH` or through `vswhere.exe`.
+
+#### Option B — portable vsget toolchain
+
+A portable Windows build has been machine-validated with `reksar/vsget`.
+
+The portable destination must contain the equivalent of:
+
+```text
+<PortableVS>\
+├─ VC\Tools\MSVC\...
+├─ MSBuild\Current\Bin\amd64\MSBuild.exe
+├─ MSBuild\Microsoft\VC\v170\Microsoft.Cpp.Default.props
+├─ MSBuild\Microsoft\VC\v170\Microsoft.Cpp.props
+├─ MSBuild\Microsoft\VC\v170\Microsoft.Cpp.targets
+├─ SDK\Windows Kits\10\...
+└─ vcvars-x64-x64.bat
+```
+
+Example validated destination:
+
+```text
+E:\PortableVS
+```
+
+The fami-pixel build wrapper constructs the required process-local MSVC/MSBuild/SDK environment itself when `-PortableVS` is supplied. It does not require permanent PATH or registry changes.
 
 ## 2. Clone the repository
 
@@ -140,10 +174,38 @@ The repository contains the canonical Windows build wrapper:
 tools\build_mesen.ps1
 ```
 
+### Installed Visual Studio / Build Tools
+
 Run:
 
 ```powershell
 .\tools\build_mesen.ps1
+```
+
+### Portable vsget toolchain
+
+Run:
+
+```powershell
+.\tools\build_mesen.ps1 -PortableVS E:\PortableVS -LowMemory
+```
+
+`-PortableVS` makes the wrapper discover and use the portable MSVC, MSBuild, VC targets, and Windows SDK from the supplied root.
+
+`-LowMemory` changes build parallelism to:
+
+```text
+MSBuild /m:1
+CL_MPCount=1
+```
+
+This mode was required on a 16 GB validation machine with limited commit/pagefile headroom. It avoids changing the machine pagefile and is safe to use on fresh or constrained PCs, at the cost of build speed.
+
+The portable wrapper also adds the Windows SDK `winrt` include directory explicitly. This is required for WRL headers such as:
+
+```text
+wrl.h
+wrl/client.h
 ```
 
 The script performs a clean `Release|x64` build of the Mesen CE `InteropDLL` target through `Mesen.sln`.
@@ -158,7 +220,7 @@ Successful output is staged to:
 build\mesen\MesenCore.dll
 ```
 
-The script then automatically runs the fami-pixel ABI probe.
+The script then automatically runs the fami-pixel ABI probe. When `.venv` exists, the repo-local virtual-environment Python is preferred for the probe.
 
 Verify:
 
@@ -172,18 +234,26 @@ Expected:
 True
 ```
 
-If PowerShell execution policy blocks the script:
+If PowerShell execution policy blocks the installed-toolchain path:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\build_mesen.ps1
+```
+
+For the portable path:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build_mesen.ps1 -PortableVS E:\PortableVS -LowMemory
 ```
 
 ## 6. Run the ABI probe manually
 
 Normally the build script already does this.
 
+With the repo-local virtual environment:
+
 ```powershell
-py .\tools\inspect_mesen_exports.py .\build\mesen\MesenCore.dll
+.\.venv\Scripts\python.exe .\tools\inspect_mesen_exports.py .\build\mesen\MesenCore.dll
 ```
 
 The DLL must expose the fami-pixel native extensions used by the Python adapter, including deterministic frame stepping and direct NES controller/framebuffer access.
@@ -231,7 +301,7 @@ Do not commit ROM files into the repository.
 After the DLL is built and the ROM path is available, run the current B-aware planner:
 
 ```powershell
-py .\examples\mesen_smb_checkpoint_planner_v7_cast.py `
+python .\examples\mesen_smb_checkpoint_planner_v7_cast.py `
   "D:\my-github\nek\roms\Super Mario Bros. (Japan, USA).nes"
 ```
 
@@ -265,7 +335,7 @@ D:\my-github\fami-pixel\build\test-reports\fami-pixel-v5-test-report-20260914-06
 run:
 
 ```powershell
-py .\examples\mesen_smb_checkpoint_planner_v7_cast.py `
+python .\examples\mesen_smb_checkpoint_planner_v7_cast.py `
   "D:\my-github\nek\roms\Super Mario Bros. (Japan, USA).nes" `
   --report-zip "D:\my-github\fami-pixel\build\test-reports\fami-pixel-v5-test-report-20260914-064240.zip" `
   --fixture pre-collapse `
@@ -303,7 +373,7 @@ fami-pixel\
 
 ## 12. Fast setup checklist
 
-For a clean machine, the core sequence is:
+### Installed Visual Studio / Build Tools
 
 ```powershell
 git clone --recurse-submodules https://github.com/cctsao1008/fami-pixel.git
@@ -313,7 +383,21 @@ cd fami-pixel
 .\.venv\Scripts\Activate.ps1
 
 .\tools\build_mesen.ps1
+python -m pytest -q
+```
 
+### Portable vsget toolchain
+
+Assuming vsget has already populated `E:\PortableVS`:
+
+```powershell
+git clone --recurse-submodules https://github.com/cctsao1008/fami-pixel.git
+cd fami-pixel
+
+.\tools\setup_python_env.ps1
+.\.venv\Scripts\Activate.ps1
+
+.\tools\build_mesen.ps1 -PortableVS E:\PortableVS -LowMemory
 python -m pytest -q
 ```
 
@@ -329,24 +413,36 @@ git submodule update --init --recursive
 
 ### `MSBuild.exe was not found`
 
-Install Visual Studio / Build Tools with:
+Use one of the two supported paths:
 
 ```text
-Desktop development with C++
-MSBuild
-MSVC x64/x86 toolchain
-Windows SDK
+- install Visual Studio / Build Tools with Desktop development with C++
+- supply a complete portable vsget tree with -PortableVS
 ```
 
-Then reopen PowerShell.
+### Missing `wrl.h` / `wrl/client.h`
+
+Use the repository wrapper with `-PortableVS`. It adds the SDK `winrt` include directory to the process-local portable environment.
+
+Confirm the file exists under the portable SDK tree, for example:
+
+```text
+E:\PortableVS\SDK\Windows Kits\10\Include\<version>\winrt\wrl.h
+```
+
+### `C3859`, `C1076`, `C1060`, or paging-file / PCH exhaustion
+
+Retry with low-memory mode:
+
+```powershell
+.\tools\build_mesen.ps1 -PortableVS E:\PortableVS -LowMemory
+```
+
+This intentionally trades build speed for lower peak commit usage.
 
 ### `MesenCore.dll not found`
 
-```powershell
-.\tools\build_mesen.ps1
-```
-
-Expected output:
+Re-run the appropriate build command. Expected staged output:
 
 ```text
 build\mesen\MesenCore.dll
