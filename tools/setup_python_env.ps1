@@ -21,13 +21,13 @@ function Invoke-Checked {
         [Parameter(Mandatory = $true)]
         [string]$Program,
 
-        [Parameter(ValueFromRemainingArguments = $true)]
-        [string[]]$Arguments
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList
     )
 
-    & $Program @Arguments
+    & $Program @ArgumentList
     if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code ${LASTEXITCODE}: $Program $($Arguments -join ' ')"
+        throw "Command failed with exit code ${LASTEXITCODE}: $Program $($ArgumentList -join ' ')"
     }
 }
 
@@ -49,7 +49,7 @@ if (-not (Test-Path $VenvPython)) {
     $BasePythonVersion = & $PyLauncher.Source --version
     Write-Host "Base Python: $BasePythonVersion"
     Write-Host "Creating virtual environment..."
-    Invoke-Checked $PyLauncher.Source -m venv $Venv
+    Invoke-Checked -Program $PyLauncher.Source -ArgumentList @("-m", "venv", $Venv)
 } else {
     Write-Host "Existing virtual environment found."
 }
@@ -68,19 +68,19 @@ Write-Host "Venv Python: $VenvVersion"
 Write-Host
 
 Write-Host "Upgrading packaging tools..."
-Invoke-Checked $VenvPython -m pip install --upgrade pip setuptools
+Invoke-Checked -Program $VenvPython -ArgumentList @("-m", "pip", "install", "--upgrade", "pip", "setuptools")
 
 Write-Host
 Write-Host "Installing fami-pixel with test dependencies..."
-Invoke-Checked $VenvPython -m pip install -e $EditableSpec
+Invoke-Checked -Program $VenvPython -ArgumentList @("-m", "pip", "install", "-e", $EditableSpec)
 
 Write-Host
 Write-Host "Verifying fami-pixel import..."
-Invoke-Checked $VenvPython -c "import fami_pixel; print(fami_pixel.__file__)"
+Invoke-Checked -Program $VenvPython -ArgumentList @("-c", "import fami_pixel; print(fami_pixel.__file__)")
 
 Write-Host
 Write-Host "Verifying pytest..."
-Invoke-Checked $VenvPython -m pytest --version
+Invoke-Checked -Program $VenvPython -ArgumentList @("-m", "pytest", "--version")
 
 Write-Host
 Write-Host "Python environment ready."
