@@ -112,7 +112,7 @@ h1 { margin: 0 0 12px; font-size: 18px; }
     <div id="frame-wrap"><img id="frame" alt="NES authoritative framebuffer"></div>
   </section>
   <aside class="card">
-    <div class="k">Committed action</div>
+    <div class="k">Applied action</div>
     <div id="action">waiting...</div>
     <div class="grid">
       <div class="k">Decision</div><div class="v" id="decision">-</div>
@@ -123,9 +123,12 @@ h1 { margin: 0 0 12px; font-size: 18px; }
       <div class="k">VX</div><div class="v" id="vx">-</div>
       <div class="k">VY</div><div class="v" id="vy">-</div>
       <div class="k">Engine</div><div class="v" id="engine">-</div>
+      <div class="k">Plan root frame</div><div class="v" id="plan_root_frame">-</div>
+      <div class="k">Plan age</div><div class="v" id="plan_age">-</div>
+      <div class="k">Planner state</div><div class="v" id="planner_state">-</div>
       <div class="k">Playback buffer</div><div class="v" id="buffered">-</div>
     </div>
-    <div id="status">buffered authoritative playback; counterfactual rollouts are hidden</div>
+    <div id="status">authoritative playback; counterfactual rollouts are hidden</div>
   </aside>
 </main>
 <script>
@@ -136,7 +139,7 @@ async function tick() {
     const s = await r.json();
     if (s.version !== version) {
       version = s.version;
-      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','buffered']) {
+      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','planner_state','buffered']) {
         const el = document.getElementById(k);
         if (el) el.textContent = s[k] ?? '-';
       }
@@ -152,13 +155,7 @@ tick();
 
 
 class NesWebViewer:
-    """Local browser observer with buffered authoritative playback.
-
-    Producers enqueue committed emulator frames as fast as the planner executes
-    them. A separate playback thread exposes those frames at a steady human-view
-    cadence, so commit bursts no longer appear as jerky browser motion and the
-    planner is never paced by the UI.
-    """
+    """Local browser observer with buffered authoritative playback."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765, playback_fps: float = 15.0):
         if host not in {"127.0.0.1", "localhost"}:
@@ -186,6 +183,9 @@ class NesWebViewer:
             "vx": None,
             "vy": None,
             "engine": None,
+            "plan_root_frame": None,
+            "plan_age": None,
+            "planner_state": None,
             "buffered": 0,
         }
         self._server: ThreadingHTTPServer | None = None
@@ -266,13 +266,14 @@ class NesWebViewer:
             else:
                 next_tick = time.monotonic()
 
-    def publish_core(self, core, observation, *, decision: int, mode: str, action: str) -> None:
+    def publish_core(self, core, observation, *, decision: int, mode: str, action: str, metadata: dict | None = None) -> None:
         frame = copy_nes_raw_frame(core)
         packed = array("H", frame.pixels).tobytes()
         vx = observation.player_x_speed
         vy = observation.player_y_speed
         vx = vx - 256 if vx >= 128 else vx
         vy = vy - 256 if vy >= 128 else vy
+        metadata = metadata or {}
         state = {
             "version": 0,
             "has_frame": True,
@@ -285,6 +286,9 @@ class NesWebViewer:
             "vx": vx,
             "vy": vy,
             "engine": f"0x{observation.game_engine_subroutine:02X}",
+            "plan_root_frame": metadata.get("plan_root_frame"),
+            "plan_age": metadata.get("plan_age"),
+            "planner_state": metadata.get("planner_state"),
             "buffered": 0,
         }
         with self._condition:
