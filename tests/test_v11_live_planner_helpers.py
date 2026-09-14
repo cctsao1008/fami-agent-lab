@@ -28,6 +28,35 @@ def test_live_candidate_pool_is_short_horizon():
     assert max(candidate.frame_count for candidate in pool) <= 12
 
 
+def test_atomic_json_retries_transient_windows_replace_conflict(tmp_path, monkeypatch):
+    path = tmp_path / "request.json"
+    real_replace = v11.os.replace
+    attempts = {"count": 0}
+
+    def flaky_replace(src, dst):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise PermissionError(5, "sharing violation")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(v11.os, "replace", flaky_replace)
+    assert v11._atomic_json(path, {"generation": 7}) is True
+    assert v11._read_json(path) == {"generation": 7}
+    assert attempts["count"] == 2
+
+
+def test_atomic_json_drops_publish_after_repeated_replace_conflicts(tmp_path, monkeypatch):
+    path = tmp_path / "request.json"
+
+    def always_locked(src, dst):
+        raise PermissionError(5, "sharing violation")
+
+    monkeypatch.setattr(v11.os, "replace", always_locked)
+    monkeypatch.setattr(v11.time, "sleep", lambda _: None)
+    assert v11._atomic_json(path, {"generation": 8}) is False
+    assert not path.exists()
+
+
 def test_best_fresh_plan_prefers_newest_root_then_score(tmp_path):
     responses = [tmp_path / "r0.json", tmp_path / "r1.json"]
     v11._atomic_json(
