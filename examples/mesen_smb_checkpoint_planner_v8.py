@@ -11,12 +11,23 @@ V8 keeps the V7 control model and immediate precision probes unchanged, then
 reduces only the *beam branching factor*. It reuses those already-evaluated root
 results to select a small semantic/state-diverse shortlist before deeper search.
 Mesen remains machine authority; only the chosen root action is committed.
+
+The CLI uses a small supervisor process. Mesen's native runtime can remain alive
+after the planner has already printed a terminal PASS/FAIL result, before the
+Python frame returns to the caller. Therefore an in-process os._exit() is too
+late. The parent process watches the worker output, recognizes the authoritative
+planner result, and terminates only the already-finished native worker if it does
+not exit promptly.
 """
 
 from __future__ import annotations
 
 import os
+import queue
+import subprocess
 import sys
+import threading
+import time
 
 from fami_pixel.games.smb1 import CandidateTerminal, score_candidate
 
@@ -31,6 +42,11 @@ MANDATORY_FORWARD_FAMILIES = (
     "right_a",    # ordinary jump
     "right",      # ordinary forward motion
 )
+
+_WORKER_ENV = "FAMI_PIXEL_V8_WORKER"
+_RESULT_PREFIX = "PlannerV7:"
+_NO_OUTPUT_TIMEOUT_S = 180.0
+_POST_RESULT_GRACE_S = 1.0
 
 _original_evaluate_candidates = v6.evaluate_candidates
 _original_beam_search = v6.beam_search
@@ -57,14 +73,7 @@ def _rank(e) -> tuple[float, int, int, int]:
 
 
 def precision_shortlist(results, limit: int = PRECISION_SHORTLIST_LIMIT):
-    """Choose a bounded semantic/state-diverse subset from V7 root probes.
-
-    Four forward-control families are retained when available because they map
-    directly to the dimensions V7 was created to expose: run+jump, run, jump,
-    and ordinary forward motion. Remaining slots are filled by the strongest
-    candidates that add a previously unseen dynamic-state signature. Any final
-    empty slots fall back to overall rank.
-    """
+    """Choose a bounded semantic/state-diverse subset from V7 root probes."""
     if limit <= 0:
         raise ValueError("precision shortlist limit must be positive")
 
@@ -134,9 +143,6 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
 
 
 def main() -> int:
-    # V7 resolves these functions through the shared v6 module object at runtime,
-    # so the patch is local to this process and leaves the reusable V6/V7 source
-    # contracts untouched.
     v6.evaluate_candidates = evaluate_candidates
     v6.beam_search = beam_search
     print("=== Planner V8: bounded B-aware precision branching ===", flush=True)
@@ -148,19 +154,103 @@ def main() -> int:
     return v7.main()
 
 
-def _cli() -> None:
-    """Run the planner and return control to the shell even if Mesen teardown stalls.
+def _result_code(line: str) -> int | None:
+    if not line.startswith(_RESULT_PREFIX):
+        return None
+    if "PASS" in line:
+        return 0
+    if "FAIL death" in line:
+        return 6
+    if "FAIL decision limit" in line:
+        return 7
+    if "FAIL" in line:
+        return 1
+    return None
 
-    The planner's result is fully determined before this point. Mesen's native
-    runtime can keep Python alive during interpreter/DLL teardown after a clean
-    result, so the CLI deliberately bypasses process finalizers once stdout and
-    stderr have been flushed. This does not change planner execution or search
-    semantics; it only bounds post-result shutdown.
-    """
-    code = main()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(code)
+
+def _reader(stream, out_queue: queue.Queue[str | None]) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            out_queue.put(line)
+    finally:
+        out_queue.put(None)
+
+
+def _terminate_worker(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2.0)
+
+
+def _supervise() -> int:
+    env = os.environ.copy()
+    env[_WORKER_ENV] = "1"
+    cmd = [sys.executable, "-u", str(__file__), *sys.argv[1:]]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    assert proc.stdout is not None
+
+    lines: queue.Queue[str | None] = queue.Queue()
+    threading.Thread(target=_reader, args=(proc.stdout, lines), daemon=True).start()
+    last_output = time.monotonic()
+
+    while True:
+        try:
+            item = lines.get(timeout=0.25)
+        except queue.Empty:
+            if proc.poll() is not None:
+                return proc.returncode or 0
+            if time.monotonic() - last_output > _NO_OUTPUT_TIMEOUT_S:
+                print(
+                    f"V8 supervisor: FAIL no worker output for {_NO_OUTPUT_TIMEOUT_S:.0f}s; terminating stalled worker.",
+                    flush=True,
+                )
+                _terminate_worker(proc)
+                return 124
+            continue
+
+        if item is None:
+            return proc.wait()
+
+        last_output = time.monotonic()
+        print(item, end="", flush=True)
+        code = _result_code(item.strip())
+        if code is None:
+            continue
+
+        try:
+            proc.wait(timeout=_POST_RESULT_GRACE_S)
+        except subprocess.TimeoutExpired:
+            print(
+                "V8 supervisor: terminal planner result observed; terminating completed native worker.",
+                flush=True,
+            )
+            _terminate_worker(proc)
+        return code
+
+
+def _cli() -> None:
+    if os.environ.get(_WORKER_ENV) == "1":
+        # If the worker returns naturally, bypass interpreter/DLL finalization.
+        # If it stalls before returning, the parent supervisor will terminate it
+        # after observing the terminal planner result line.
+        code = main()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+
+    raise SystemExit(_supervise())
 
 
 if __name__ == "__main__":
