@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Fast, observable V8 wrapper around the V7 B-aware SMB1 planner.
 
-V8 keeps Mesen as machine authority, but trims research-time overhead for live
-runs: candidate endpoint captures are disabled by default, safe high-progress
-coarse ties bypass precision search, and precision beam search uses a bounded
-4-way / depth-2 budget. ``--full-search`` restores the previous exhaustive V8
-behavior for audit runs.
+FAST mode is deliberately adaptive:
+- normal coarse search starts with four representative 30-frame actions,
+- the remaining coarse actions are evaluated only when progress looks weak,
+- scheduled V7 coarse audit beams are disabled unless explicitly requested,
+- ordinary precision uses a 4-way/depth-2 budget,
+- imminent falling/all-terminal hazards get a larger 6-way/depth-3 budget.
 
-``--web-ui`` remains observer-only: only authoritative committed frames are
-sampled and published. Counterfactual rollouts stay headless.
+``--full-search`` restores the V7/V8 research-heavy behavior. ``--web-ui`` is
+observer-only: only authoritative committed frames are sampled; counterfactual
+rollouts remain headless and never pace emulator execution.
 """
 
 from __future__ import annotations
@@ -37,10 +39,15 @@ import mesen_smb_checkpoint_planner_v6 as v6
 import mesen_smb_checkpoint_planner_v7 as v7
 
 
-PRECISION_SHORTLIST_LIMIT = 4
+FAST_COARSE_NAMES = frozenset(("cruise", "run", "tap_jump", "run_tap_jump"))
 FAST_PROGRESS_THRESHOLD = 60
+FAST_PRECISION_SHORTLIST = 4
 FAST_PRECISION_DEPTH = 2
 FAST_PRECISION_WIDTH = 4
+HAZARD_PRECISION_SHORTLIST = 6
+HAZARD_PRECISION_DEPTH = 3
+HAZARD_PRECISION_WIDTH = 6
+LOW_FALL_Y = 150
 CAPTURE_AUDIT_INTERVAL = 10
 MANDATORY_FORWARD_FAMILIES = (
     "right_a_b",
@@ -48,6 +55,7 @@ MANDATORY_FORWARD_FAMILIES = (
     "right_a",
     "right",
 )
+HAZARD_REASONS = frozenset(("all-coarse-actions-terminal", "coarse-best-descending-low"))
 
 _WORKER_ENV = "FAMI_PIXEL_V8_WORKER"
 _RESULT_PREFIX = "PlannerV7:"
@@ -61,7 +69,9 @@ _original_select_immediate = v6.select_immediate
 _original_precision_trigger = v6.precision_trigger
 _original_capture_authoritative = v6.capture_authoritative
 
+_last_coarse_results = None
 _last_precision_results = None
+_last_precision_reason: str | None = None
 _last_selection_mode = "B-AWARE COARSE FAST"
 _web_viewer: NesWebViewer | None = None
 _web_fps = 15.0
@@ -93,8 +103,12 @@ def _rank(e) -> tuple[float, int, int, int]:
     )
 
 
-def precision_shortlist(results, limit: int = PRECISION_SHORTLIST_LIMIT):
-    """Choose a bounded semantic/state-diverse subset from V7 root probes."""
+def _signed_byte(value: int) -> int:
+    return value - 256 if value >= 128 else value
+
+
+def precision_shortlist(results, limit: int):
+    """Choose a bounded semantic/state-diverse subset from immediate probes."""
     if limit <= 0:
         raise ValueError("precision shortlist limit must be positive")
 
@@ -119,9 +133,7 @@ def precision_shortlist(results, limit: int = PRECISION_SHORTLIST_LIMIT):
     for e in ranked:
         if len(selected) >= limit:
             break
-        if e.outcome.candidate.name in selected_names:
-            continue
-        if e.signature not in seen_signatures:
+        if e.outcome.candidate.name not in selected_names and e.signature not in seen_signatures:
             add(e)
 
     for e in ranked:
@@ -132,13 +144,45 @@ def precision_shortlist(results, limit: int = PRECISION_SHORTLIST_LIMIT):
     return tuple(selected)
 
 
+def _call_evaluate(args, kwargs, candidates):
+    local_args = list(args)
+    local_args[1] = tuple(candidates)
+    return _original_evaluate_candidates(*local_args, **kwargs)
+
+
 def evaluate_candidates(*args, **kwargs):
-    """Evaluate candidates without per-endpoint save-state capture in fast mode."""
-    global _last_precision_results
+    """Use two-stage coarse evaluation and no endpoint captures in FAST mode."""
+    global _last_coarse_results, _last_precision_results
+
+    mode = kwargs.get("mode")
     if not _full_search:
         kwargs["capture_dir"] = None
+
+    if not _full_search and mode == "coarse":
+        all_candidates = tuple(args[1])
+        fast_candidates = tuple(c for c in all_candidates if c.name in FAST_COARSE_NAMES)
+        fast_results = _call_evaluate(args, kwargs, fast_candidates)
+        safe = [e for e in fast_results if e.outcome.terminal == CandidateTerminal.NONE]
+        best_progress = max((e.outcome.progress for e in safe), default=-10**9)
+
+        if safe and best_progress >= FAST_PROGRESS_THRESHOLD:
+            results = fast_results
+        else:
+            remaining = tuple(c for c in all_candidates if c.name not in FAST_COARSE_NAMES)
+            extra_results = _call_evaluate(args, kwargs, remaining) if remaining else ()
+            by_name = {
+                e.outcome.candidate.name: e
+                for e in (*fast_results, *extra_results)
+            }
+            results = tuple(by_name[c.name] for c in all_candidates if c.name in by_name)
+
+        _last_coarse_results = results
+        return results
+
     results = _original_evaluate_candidates(*args, **kwargs)
-    if kwargs.get("mode") == "precision":
+    if mode == "coarse":
+        _last_coarse_results = results
+    elif mode == "precision":
         _last_precision_results = results
     return results
 
@@ -146,28 +190,51 @@ def evaluate_candidates(*args, **kwargs):
 def capture_authoritative(state_file, capture_dir, decision, frame, x):
     """Keep sparse durable witnesses instead of copying/hashing every decision."""
     if _full_search or decision == 1 or decision % CAPTURE_AUDIT_INTERVAL == 0:
-        return _original_capture_authoritative(
-            state_file, capture_dir, decision, frame, x
-        )
+        return _original_capture_authoritative(state_file, capture_dir, decision, frame, x)
     return None
 
 
 def precision_trigger(results):
-    """Skip expensive precision search on clearly healthy high-progress coarse ties."""
+    """Escalate only when coarse state predicts real risk; skip healthy ties."""
+    global _last_precision_reason
+
     reason = _original_precision_trigger(results)
-    if _full_search or reason != "state-divergent-progress-tie":
+    if _full_search:
+        _last_precision_reason = reason
         return reason
 
     safe = [e for e in results if e.outcome.terminal == CandidateTerminal.NONE]
     if not safe:
+        _last_precision_reason = reason
         return reason
+
+    best = max(safe, key=_rank)
+    obs = best.observation
+    descending_low = (
+        obs.player_state == 2
+        and _signed_byte(obs.player_y_speed) > 0
+        and obs.mario_y >= LOW_FALL_Y
+    )
+    if descending_low:
+        reason = "coarse-best-descending-low"
+        print(
+            f"V8 hazard: coarse best ends descending low "
+            f"(Y={obs.mario_y}, VY={_signed_byte(obs.player_y_speed):+d}); precision required",
+            flush=True,
+        )
+        _last_precision_reason = reason
+        return reason
+
     best_progress = max(e.outcome.progress for e in safe)
-    if best_progress >= FAST_PROGRESS_THRESHOLD:
+    if reason == "state-divergent-progress-tie" and best_progress >= FAST_PROGRESS_THRESHOLD:
         print(
             f"V8 fast gate: coarse progress={best_progress:+d}; precision search skipped",
             flush=True,
         )
+        _last_precision_reason = None
         return None
+
+    _last_precision_reason = reason
     return reason
 
 
@@ -197,14 +264,28 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
             )
             raise
 
-    shortlist_results = precision_shortlist(_last_precision_results)
-    shortlist = tuple(e.outcome.candidate for e in shortlist_results)
+    hazard = (not _full_search and _last_precision_reason in HAZARD_REASONS)
     if _full_search:
+        limit = len(v7.PRECISION_CANDIDATES)
         effective_depth = depth
-        effective_width = min(width, len(shortlist))
+        effective_width = width
+    elif hazard:
+        limit = HAZARD_PRECISION_SHORTLIST
+        effective_depth = min(depth, HAZARD_PRECISION_DEPTH)
+        effective_width = min(width, HAZARD_PRECISION_WIDTH)
+        print(
+            f"V8 hazard search: reason={_last_precision_reason}; "
+            f"beam <= {limit}x{effective_depth}",
+            flush=True,
+        )
     else:
+        limit = FAST_PRECISION_SHORTLIST
         effective_depth = min(depth, FAST_PRECISION_DEPTH)
-        effective_width = min(width, FAST_PRECISION_WIDTH, len(shortlist))
+        effective_width = min(width, FAST_PRECISION_WIDTH)
+
+    shortlist_results = precision_shortlist(_last_precision_results, limit)
+    shortlist = tuple(e.outcome.candidate for e in shortlist_results)
+    effective_width = min(effective_width, len(shortlist))
 
     try:
         root_name, logs = _original_beam_search(
@@ -223,11 +304,9 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
         raise
 
     _last_selection_mode = "B-AWARE PRECISION"
-    names = ", ".join(e.outcome.candidate.name for e in shortlist_results)
     prefix = (
         f"  V8 branch governor: {len(candidates)} -> {len(shortlist)}; "
         f"beam depth={effective_depth} width={effective_width}",
-        f"  V8 shortlist: {names}",
     )
     return root_name, prefix + logs
 
@@ -253,9 +332,7 @@ def _observed_commit_candidate(core, candidate, start_observation, episode, time
                 current.game_engine_subroutine == base.FLAGPOLE_SLIDE
             )
 
-            level_complete = any(
-                event.kind == GameEventType.LEVEL_COMPLETED for event in events
-            )
+            level_complete = any(event.kind == GameEventType.LEVEL_COMPLETED for event in events)
             died = any(event.kind == GameEventType.DIED for event in events)
             terminal_now = level_complete or died
 
@@ -290,6 +367,7 @@ def _consume_v8_args() -> tuple[bool, int, float, bool]:
     port = 8765
     fps = 15.0
     full_search = False
+    explicit_audit_interval = False
     cleaned = [sys.argv[0]]
     i = 1
     while i < len(sys.argv):
@@ -305,6 +383,8 @@ def _consume_v8_args() -> tuple[bool, int, float, bool]:
         if arg == "--verbose-log":
             i += 1
             continue
+        if arg == "--audit-interval" or arg.startswith("--audit-interval="):
+            explicit_audit_interval = True
         if arg == "--web-port":
             if i + 1 >= len(sys.argv):
                 raise ValueError("--web-port requires an integer")
@@ -327,8 +407,11 @@ def _consume_v8_args() -> tuple[bool, int, float, bool]:
             continue
         cleaned.append(arg)
         i += 1
+
     if fps <= 0:
         raise ValueError("--web-fps must be > 0")
+    if not full_search and not explicit_audit_interval:
+        cleaned.extend(("--audit-interval", "1000000"))
     sys.argv[:] = cleaned
     return enabled, port, fps, full_search
 
@@ -363,9 +446,9 @@ def main() -> int:
     )
     if not _full_search:
         print(
-            f"V8 fast search: coarse-tie gate >= {FAST_PROGRESS_THRESHOLD}px; "
-            f"precision beam <= {PRECISION_SHORTLIST_LIMIT}x{FAST_PRECISION_DEPTH}; "
-            f"captures every {CAPTURE_AUDIT_INTERVAL} decisions",
+            "V8 fast search: adaptive coarse 4->8 on risk; scheduled coarse audit off; "
+            f"precision <= {FAST_PRECISION_SHORTLIST}x{FAST_PRECISION_DEPTH}; "
+            f"hazard <= {HAZARD_PRECISION_SHORTLIST}x{HAZARD_PRECISION_DEPTH}",
             flush=True,
         )
     return v7.main()
@@ -410,7 +493,6 @@ def _print_timestamped(line: str) -> None:
 
 
 def _compact_log_line(line: str) -> bool:
-    """Keep operational telemetry; the browser now carries play-by-play detail."""
     s = line.strip()
     if not s:
         return False
@@ -432,6 +514,8 @@ def _compact_log_line(line: str) -> bool:
         "Decision #",
         "CONTROL ALERT",
         "V8 fast gate:",
+        "V8 hazard:",
+        "V8 hazard search:",
         "V8 branch governor:",
         "Beam choice:",
         "Selected action:",
