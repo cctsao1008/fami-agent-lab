@@ -213,6 +213,7 @@ $EnvironmentNames = @(
     "VSINSTALLDIR",
     "VCINSTALLDIR",
     "VCToolsInstallDir",
+    "VCToolsVersion",
     "WindowsSDKDir",
     "WindowsSDKVersion",
     "WindowsSDK_IncludePath",
@@ -243,6 +244,7 @@ try {
         [Environment]::SetEnvironmentVariable("VSINSTALLDIR", "$($PortableEnvironment.Root)\", "Process")
         [Environment]::SetEnvironmentVariable("VCINSTALLDIR", "$($PortableEnvironment.Root)\VC\", "Process")
         [Environment]::SetEnvironmentVariable("VCToolsInstallDir", "$($PortableEnvironment.VCToolsInstallDir)\", "Process")
+        [Environment]::SetEnvironmentVariable("VCToolsVersion", $PortableEnvironment.MsvcVersion, "Process")
         [Environment]::SetEnvironmentVariable($PortableEnvironment.VCToolsVersionVariable, "$($PortableEnvironment.VCToolsInstallDir)\", "Process")
         [Environment]::SetEnvironmentVariable("WindowsSDKDir", "$($PortableEnvironment.WindowsSDKDir)\", "Process")
         [Environment]::SetEnvironmentVariable("WindowsSDKVersion", "$($PortableEnvironment.SdkVersion)\", "Process")
