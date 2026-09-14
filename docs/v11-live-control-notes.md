@@ -53,9 +53,21 @@ Planner V11: continuous authority + 4 parallel shadow workers; control=4f freshn
 PlannerV11: FAIL death | frame=329 X=314
 ```
 
-There were no `control update:` lines before death. That means the first implementation proved that authority could continue advancing, but the planner deadline model was wrong: four workers each evaluated two 30-frame candidates, so no plan arrived inside the 8-frame freshness window before the bootstrap `RIGHT+B` controller reached the first hazard.
+There were no `control update:` lines before death. That gives two pieces of evidence:
+
+1. the authoritative loop really did continue running while the shadow processes were busy, so the architectural direction is correct,
+2. the planner deadline model was wrong: four workers each evaluated two 30-frame candidates, so no plan arrived inside the 8-frame freshness window before the bootstrap `RIGHT+B` controller reached the first hazard.
 
 A second bug was exposed at the terminal edge: after `PlannerV11: FAIL death`, the Python process did not return promptly. V11 now runs authority under an outer supervisor. Once a terminal `PlannerV11:` result is observed, the supervisor gives teardown a short grace period and then terminates the whole authority + shadow process tree on Windows if needed.
+
+## Changes after first machine run
+
+- live candidate horizon reduced from 30f to 8..12f,
+- one candidate per worker with four default workers,
+- freshness window increased from 8f to 16f for this first real-time implementation,
+- bootstrap changed from blind `RIGHT+B` to a repeating jump/run pulse,
+- shadow stdout/stderr suppressed so native warnings do not interleave the authority console,
+- terminal supervisor added so the shell returns even if native teardown blocks.
 
 ## Expected console evidence after the fix
 
