@@ -10,40 +10,78 @@ Validation should distinguish three clocks:
 
 A valid live-control run should show native frames advancing steadily even while the planner pool is busy. A late result is discarded when `plan_age` exceeds the configured freshness window.
 
-Initial defaults:
+## Current defaults
 
 ```text
 authority cadence : nominal 60 Hz
 UI cadence        : 30 Hz
 control quantum   : 4 frames (~15 Hz)
-plan freshness    : 8 frames
+plan freshness    : 16 frames
 shadow workers    : 4
-coarse candidates : 8, sharded across workers
+live candidates   : 4 short probes, 8..12 frames each
 ```
 
-The shadow pool evaluates the bounded V7 coarse action family with V10 pit-aware rollout semantics. With four workers, each worker normally evaluates two candidates per generation. Workers abandon stale generations when a newer authoritative snapshot arrives.
+The live pool is intentionally different from the V10 synchronous research oracle. V10 can afford 30-frame macros because it stops authority while searching. V11 cannot: if native shadow stepping is close to real time, a 30-frame rollout already consumes roughly half a second and is stale before a 4-frame control deadline.
 
-The first objective is proving the concurrency and freshness contract before restoring richer adaptive beam search.
-
-## Expected console evidence
-
-A healthy run should contain interleaved live control updates such as:
+The live candidate set is therefore:
 
 ```text
-[hh:mm:ss.mmm] Planner V11: continuous authority + 4 parallel shadow workers; control=4f freshness=8f
-[hh:mm:ss.mmm] control update: run root=244 age=4f worker=1 compute=38.2ms
-[hh:mm:ss.mmm] control update: run_tap_jump root=252 age=4f worker=3 compute=41.7ms
+right_b_8
+right_a_b_8
+right_a_b_12
+right_8
 ```
 
-The important observation is that `native frame` in the Web UI continues to change while shadow computation is in progress.
+With four workers, each worker evaluates one live candidate. V10 pit-aware rollout semantics are still reused inside shadow instances.
+
+Until the first fresh plan arrives, authority uses a repeating pulse-jump bootstrap:
+
+```text
+RIGHT+A+B 8f
+RIGHT+B   8f
+repeat
+```
+
+This is only a bootstrap controller; it is replaced as soon as a fresh shadow plan is available.
+
+## First machine run: 2026-09-15
+
+Observed:
+
+```text
+Planner V11: continuous authority + 4 parallel shadow workers; control=4f freshness=8f
+PlannerV11: FAIL death | frame=329 X=314
+```
+
+There were no `control update:` lines before death. That means the first implementation proved that authority could continue advancing, but the planner deadline model was wrong: four workers each evaluated two 30-frame candidates, so no plan arrived inside the 8-frame freshness window before the bootstrap `RIGHT+B` controller reached the first hazard.
+
+A second bug was exposed at the terminal edge: after `PlannerV11: FAIL death`, the Python process did not return promptly. V11 now runs authority under an outer supervisor. Once a terminal `PlannerV11:` result is observed, the supervisor gives teardown a short grace period and then terminates the whole authority + shadow process tree on Windows if needed.
+
+## Expected console evidence after the fix
+
+A healthy run should contain live control updates before the first hazard, for example:
+
+```text
+[hh:mm:ss.mmm] Planner V11: continuous authority + 4 parallel shadow workers; control=4f freshness=16f live-horizon=8..12f
+[hh:mm:ss.mmm] control update: right+B 8f root=... age=...f worker=... compute=...ms
+[hh:mm:ss.mmm] control update: right+A+B 12f root=... age=...f worker=... compute=...ms
+```
+
+The important evidence is not whether World 1-1 is completed yet. It is:
+
+1. native frames keep advancing while planning runs,
+2. at least one fresh `control update:` arrives before bootstrap-only behavior reaches the first hazard,
+3. `plan_age` stays within the freshness window when a plan is applied,
+4. terminal output returns to the shell promptly.
 
 ## Failure signals
 
 The following indicate architecture problems rather than ordinary policy failure:
 
 - the authoritative frame freezes while workers search,
+- no `control update:` arrives before bootstrap reaches the first hazard,
 - plan age repeatedly exceeds the freshness window,
-- no shadow result arrives before bootstrap control reaches a hazard,
+- terminal output appears but the parent process does not return,
 - a shadow process touches the authoritative Mesen home or machine instance,
 - an authoritative game event is inferred from a shadow candidate rather than real execution.
 
