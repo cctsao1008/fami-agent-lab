@@ -27,7 +27,7 @@ function Invoke-Checked {
 
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code $LASTEXITCODE: $Program $($Arguments -join ' ')"
+        throw "Command failed with exit code ${LASTEXITCODE}: $Program $($Arguments -join ' ')"
     }
 }
 
