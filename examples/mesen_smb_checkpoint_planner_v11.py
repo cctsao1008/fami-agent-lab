@@ -117,6 +117,17 @@ def _score_outcome(outcome) -> tuple[int, int, int, int]:
     )
 
 
+def _schedule_payload(candidate) -> list[dict[str, int]]:
+    return [
+        {"buttons": int(command.nes_buttons), "frames": int(command.frame_count)}
+        for command in candidate.commands
+    ]
+
+
+def _schedule_label(candidate_name: str) -> str:
+    return v7.action_label(candidate_name)
+
+
 def shadow_worker_main(args: argparse.Namespace) -> int:
     assert args.request is not None and args.response is not None
     candidates = _candidate_shard(args.worker_index, args.worker_count)
@@ -154,8 +165,6 @@ def shadow_worker_main(args: argparse.Namespace) -> int:
 
         try:
             for candidate in candidates:
-                # Latest-value semantics: if authority has published a newer
-                # generation, abandon this stale shard before spending more CPU.
                 newest = _read_json(args.request)
                 if newest is not None and int(newest.get("generation", generation)) > generation:
                     break
@@ -177,7 +186,7 @@ def shadow_worker_main(args: argparse.Namespace) -> int:
                         "worker": args.worker_index,
                         "root_frame": root_frame,
                         "candidate": best.name,
-                        "buttons": int(best.commands[0].nes_buttons),
+                        "schedule": _schedule_payload(best),
                         "score": list(best_score),
                         "progress": best_outcome.progress,
                         "terminal": best_outcome.terminal.value,
@@ -232,9 +241,17 @@ def _best_fresh_plan(response_paths: list[Path], current_frame: int, freshness: 
         plans.append(response)
     if not plans:
         return None
-    # Prefer newest root first, then candidate score. This prevents an older but
-    # slightly higher-progress rollout from displacing a fresher control update.
     return max(plans, key=lambda p: (int(p["root_frame"]), tuple(p.get("score", []))))
+
+
+def _schedule_buttons(schedule: list[dict], elapsed_frames: int) -> int:
+    remaining = max(0, int(elapsed_frames))
+    for segment in schedule:
+        frames = int(segment["frames"])
+        if remaining < frames:
+            return int(segment["buttons"])
+        remaining -= frames
+    return int(schedule[-1]["buttons"]) if schedule else BOOTSTRAP_BUTTONS
 
 
 def authority_main(args: argparse.Namespace) -> int:
@@ -273,8 +290,9 @@ def authority_main(args: argparse.Namespace) -> int:
         f"control={args.control_quantum}f freshness={args.plan_freshness}f"
     )
 
-    applied_buttons = BOOTSTRAP_BUTTONS
+    applied_schedule = [{"buttons": BOOTSTRAP_BUTTONS, "frames": args.max_frames}]
     applied_label = "BOOTSTRAP RIGHT+B"
+    applied_plan_root = current.native_frame_id
     generation = 0
     last_applied_generation = -1
     last_plan_root = -1
@@ -283,8 +301,9 @@ def authority_main(args: argparse.Namespace) -> int:
 
     try:
         for loop_index in range(args.max_frames):
-            # The plant never waits for planning. Advance exactly one authoritative
-            # frame using the most recently accepted control input.
+            schedule_age = max(0, current.native_frame_id - applied_plan_root)
+            applied_buttons = _schedule_buttons(applied_schedule, schedule_age)
+
             base.set_nes_controller_state(core, 0, applied_buttons)
             base.step(core, args.step_timeout)
             state = read_smb1_state(core)
@@ -314,7 +333,6 @@ def authority_main(args: argparse.Namespace) -> int:
                 return 0
 
             if loop_index % args.control_quantum == 0:
-                # Consume the best plan already available; never wait for a worker.
                 plan = _best_fresh_plan(
                     response_paths,
                     current.native_frame_id,
@@ -322,10 +340,11 @@ def authority_main(args: argparse.Namespace) -> int:
                     last_applied_generation,
                 )
                 if plan is not None:
-                    applied_buttons = int(plan["buttons"])
-                    applied_label = str(plan["candidate"])
+                    applied_schedule = list(plan.get("schedule") or [])
+                    applied_label = _schedule_label(str(plan["candidate"]))
+                    applied_plan_root = int(plan["root_frame"])
                     last_applied_generation = int(plan["generation"])
-                    last_plan_root = int(plan["root_frame"])
+                    last_plan_root = applied_plan_root
                     last_plan_age = int(plan["age"])
                     last_plan_compute_ms = float(plan.get("compute_ms", 0.0))
                     _log(
@@ -334,9 +353,6 @@ def authority_main(args: argparse.Namespace) -> int:
                         f"compute={last_plan_compute_ms:.1f}ms"
                     )
 
-                # Publish a new latest-value checkpoint. Use generation-named files
-                # so lagging workers never race against authority overwriting a
-                # checkpoint that they are still loading.
                 generation += 1
                 checkpoint = checkpoint_dir / f"live-{generation:06d}.mss"
                 frame, x, engine = base.save_checkpoint(core, checkpoint)
@@ -351,8 +367,6 @@ def authority_main(args: argparse.Namespace) -> int:
                     },
                 )
 
-                # Keep only a small rolling window; old generations are stale by
-                # definition and should not accumulate on disk.
                 keep = max(4, (args.plan_freshness // args.control_quantum) + 4)
                 obsolete_generation = generation - keep
                 if obsolete_generation > 0:
