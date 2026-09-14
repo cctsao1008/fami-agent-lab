@@ -2,22 +2,12 @@
 """V8 branch-governed wrapper around the V7 B-aware planner.
 
 V7 proved that the richer B-aware control space is useful, but its precision
-beam expands all 27 short primitives at every node. That turns one precision
-trigger into hundreds of Mesen counterfactual rollouts and repeated save/load
-operations, which is exactly where the latest machine run hit native frame-step
-status 4.
+beam expands all 27 short primitives at every node. V8 keeps all immediate
+probes, then limits only deeper beam branching.
 
-V8 keeps the V7 control model and immediate precision probes unchanged, then
-reduces only the *beam branching factor*. It reuses those already-evaluated root
-results to select a small semantic/state-diverse shortlist before deeper search.
-Mesen remains machine authority; only the chosen root action is committed.
-
-The CLI uses a small supervisor process. Mesen's native runtime can remain alive
-after the planner has already printed a terminal PASS/FAIL result, before the
-Python frame returns to the caller. Therefore an in-process os._exit() is too
-late. The parent process watches the worker output, recognizes the authoritative
-planner result, and terminates only the already-finished native worker if it does
-not exit promptly.
+Optional ``--web-ui`` observability is strictly authoritative: candidate/beam
+rollouts remain hidden, while only the selected action replay publishes NES
+frames and telemetry to a localhost browser viewer.
 """
 
 from __future__ import annotations
@@ -28,19 +18,29 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 
-from fami_pixel.games.smb1 import CandidateTerminal, score_candidate
+from fami_pixel.games.smb1 import (
+    CandidateTerminal,
+    GameEventType,
+    derive_game_events,
+    observation_from_state,
+    read_smb1_state,
+    score_candidate,
+)
+from fami_pixel.telemetry import NesWebViewer
 
+import mesen_smb_checkpoint_planner as base
 import mesen_smb_checkpoint_planner_v6 as v6
 import mesen_smb_checkpoint_planner_v7 as v7
 
 
 PRECISION_SHORTLIST_LIMIT = 6
 MANDATORY_FORWARD_FAMILIES = (
-    "right_a_b",  # running jump
-    "right_b",    # running / speed build
-    "right_a",    # ordinary jump
-    "right",      # ordinary forward motion
+    "right_a_b",
+    "right_b",
+    "right_a",
+    "right",
 )
 
 _WORKER_ENV = "FAMI_PIXEL_V8_WORKER"
@@ -50,11 +50,15 @@ _POST_RESULT_GRACE_S = 1.0
 
 _original_evaluate_candidates = v6.evaluate_candidates
 _original_beam_search = v6.beam_search
+_original_select_immediate = v6.select_immediate
 _last_precision_results = None
+_last_selection_mode = "B-AWARE COARSE FAST"
+_web_viewer: NesWebViewer | None = None
+_web_fps = 30.0
+_commit_decision = 0
 
 
 def _family(name: str) -> str:
-    """Return the semantic action family without its frame-duration suffix."""
     stem, sep, suffix = name.rpartition("_")
     if sep and suffix.isdigit():
         return stem
@@ -119,9 +123,19 @@ def evaluate_candidates(*args, **kwargs):
     return results
 
 
+def select_immediate(results):
+    global _last_selection_mode
+    _last_selection_mode = "B-AWARE COARSE FAST"
+    return _original_select_immediate(results)
+
+
 def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
                 root_observation, timeout_s, depth, width, tag):
+    global _last_selection_mode
+
     if tag != "v7-precision" or _last_precision_results is None:
+        if tag == "v7-coarse":
+            _last_selection_mode = "B-AWARE COARSE BEAM"
         return _original_beam_search(
             core, candidates, root_file, root_frame, root_x, root_engine,
             root_observation, timeout_s, depth, width, tag,
@@ -134,6 +148,7 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
         core, shortlist, root_file, root_frame, root_x, root_engine,
         root_observation, timeout_s, depth, shortlist_width, "v8-precision",
     )
+    _last_selection_mode = "B-AWARE PRECISION"
     names = ", ".join(e.outcome.candidate.name for e in shortlist_results)
     prefix = (
         f"  V8 branch governor: {len(candidates)} -> {len(shortlist)} precision families/states",
@@ -142,9 +157,110 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
     return root_name, prefix + logs
 
 
+def _observed_commit_candidate(core, candidate, start_observation, episode, timeout_s):
+    """Replay only the selected candidate while publishing authoritative frames."""
+    global _commit_decision
+    _commit_decision += 1
+    previous = start_observation
+    reached_flagpole = previous.game_engine_subroutine == base.FLAGPOLE_SLIDE
+    terminal = CandidateTerminal.NONE
+    delay = 1.0 / _web_fps if _web_fps > 0 else 0.0
+
+    for command in candidate.commands:
+        base.set_nes_controller_state(core, 0, command.nes_buttons)
+        for _ in range(command.frame_count):
+            base.step(core, timeout_s)
+            state = read_smb1_state(core)
+            current = observation_from_state(core.frame_count(), state)
+            events = derive_game_events(previous, current)
+            episode.record(current, events)
+            reached_flagpole = reached_flagpole or (
+                current.game_engine_subroutine == base.FLAGPOLE_SLIDE
+            )
+
+            if _web_viewer is not None:
+                _web_viewer.publish_core(
+                    core,
+                    current,
+                    decision=_commit_decision,
+                    mode=_last_selection_mode,
+                    action=v7.action_label(candidate.name),
+                )
+                if delay:
+                    time.sleep(delay)
+
+            if any(event.kind == GameEventType.LEVEL_COMPLETED for event in events):
+                terminal = CandidateTerminal.LEVEL_COMPLETE
+            elif any(event.kind == GameEventType.DIED for event in events):
+                terminal = CandidateTerminal.DEATH
+            previous = current
+            if terminal != CandidateTerminal.NONE:
+                break
+        if terminal != CandidateTerminal.NONE:
+            break
+
+    base.set_nes_controller_state(core, 0, 0x00)
+    return previous, terminal, reached_flagpole
+
+
+def _consume_web_args() -> tuple[bool, int, float]:
+    """Remove V8-only web flags before V7 argparse sees argv."""
+    enabled = False
+    port = 8765
+    fps = 30.0
+    cleaned = [sys.argv[0]]
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--web-ui":
+            enabled = True
+            i += 1
+            continue
+        if arg == "--web-port":
+            if i + 1 >= len(sys.argv):
+                raise ValueError("--web-port requires an integer")
+            port = int(sys.argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--web-port="):
+            port = int(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if arg == "--web-fps":
+            if i + 1 >= len(sys.argv):
+                raise ValueError("--web-fps requires a number")
+            fps = float(sys.argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith("--web-fps="):
+            fps = float(arg.split("=", 1)[1])
+            i += 1
+            continue
+        cleaned.append(arg)
+        i += 1
+    sys.argv[:] = cleaned
+    return enabled, port, fps
+
+
 def main() -> int:
+    global _web_viewer, _web_fps
+
+    web_enabled, web_port, _web_fps = _consume_web_args()
     v6.evaluate_candidates = evaluate_candidates
     v6.beam_search = beam_search
+    v6.select_immediate = select_immediate
+
+    if web_enabled:
+        _web_viewer = NesWebViewer(port=web_port)
+        _web_viewer.start()
+        v7.commit_candidate = _observed_commit_candidate
+        print(f"Web UI    : {_web_viewer.url}", flush=True)
+        print("Web scope : authoritative committed frames only; beam rollouts hidden", flush=True)
+        try:
+            webbrowser.open(_web_viewer.url, new=2)
+        except Exception:
+            pass
+
     print("=== Planner V8: bounded B-aware precision branching ===", flush=True)
     print(
         f"Precision branch governor: immediate probes stay at {len(v7.PRECISION_CANDIDATES)}, "
@@ -242,9 +358,6 @@ def _supervise() -> int:
 
 def _cli() -> None:
     if os.environ.get(_WORKER_ENV) == "1":
-        # If the worker returns naturally, bypass interpreter/DLL finalization.
-        # If it stalls before returning, the parent supervisor will terminate it
-        # after observing the terminal planner result line.
         code = main()
         sys.stdout.flush()
         sys.stderr.flush()
