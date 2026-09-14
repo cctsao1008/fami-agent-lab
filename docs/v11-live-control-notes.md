@@ -53,38 +53,70 @@ Planner V11: continuous authority + 4 parallel shadow workers; control=4f freshn
 PlannerV11: FAIL death | frame=329 X=314
 ```
 
-There were no `control update:` lines before death. That gives two pieces of evidence:
+There were no `control update:` lines before death. That gave two pieces of evidence:
 
-1. the authoritative loop really did continue running while the shadow processes were busy, so the architectural direction is correct,
+1. the authoritative loop really did continue running while the shadow processes were busy, so the architectural direction was correct,
 2. the planner deadline model was wrong: four workers each evaluated two 30-frame candidates, so no plan arrived inside the 8-frame freshness window before the bootstrap `RIGHT+B` controller reached the first hazard.
 
 A second bug was exposed at the terminal edge: after `PlannerV11: FAIL death`, the Python process did not return promptly. V11 now runs authority under an outer supervisor. Once a terminal `PlannerV11:` result is observed, the supervisor gives teardown a short grace period and then terminates the whole authority + shadow process tree on Windows if needed.
 
-## Changes after first machine run
+## Second machine run: fresh live plans validated
 
-- live candidate horizon reduced from 30f to 8..12f,
-- one candidate per worker with four default workers,
-- freshness window increased from 8f to 16f for this first real-time implementation,
-- bootstrap changed from blind `RIGHT+B` to a repeating jump/run pulse,
-- shadow stdout/stderr suppressed so native warnings do not interleave the authority console,
-- terminal supervisor added so the shell returns even if native teardown blocks.
+The revised 8–12 frame live pool produced continuous fresh control updates while the authoritative game kept advancing.
 
-## Expected console evidence after the fix
-
-A healthy run should contain live control updates before the first hazard, for example:
+Representative evidence:
 
 ```text
-[hh:mm:ss.mmm] Planner V11: continuous authority + 4 parallel shadow workers; control=4f freshness=16f live-horizon=8..12f
-[hh:mm:ss.mmm] control update: right+B 8f root=... age=...f worker=... compute=...ms
-[hh:mm:ss.mmm] control update: right+A+B 12f root=... age=...f worker=... compute=...ms
+control update: right+A+B 12f root=197 age=8f worker=2 compute=223.8ms
+control update: right+B 8f root=201 age=8f worker=0 compute=136.1ms
+control update: right+A+B 8f root=245 age=8f worker=1 compute=141.6ms
+...
+PlannerV11: FAIL death | frame=375 X=298
+V11 supervisor: terminal result observed; terminating authority + shadow process tree
 ```
 
-The important evidence is not whether World 1-1 is completed yet. It is:
+Observed live-planner characteristics:
 
-1. native frames keep advancing while planning runs,
-2. at least one fresh `control update:` arrives before bootstrap-only behavior reaches the first hazard,
-3. `plan_age` stays within the freshness window when a plan is applied,
-4. terminal output returns to the shell promptly.
+- fresh plans usually arrived at age 8–12 frames,
+- observed worker compute time was roughly 116–224 ms,
+- plans remained inside the 16-frame freshness window,
+- the shell returned promptly after the terminal event.
+
+This is the first machine evidence that V11 is operating as a rolling sampled-data controller rather than the V1–V10 stop-plan-commit loop.
+
+Policy quality is still immature: the live short-horizon controller died around X=298. That is now a policy/horizon problem, not evidence that authority is waiting for planning.
+
+## Windows latest-value IPC race
+
+Two additional runs exposed a separate implementation bug:
+
+```text
+PermissionError: [WinError 5] access denied
+request.json.tmp -> request.json
+```
+
+The previous fixed-name atomic exchange used `os.replace()` while four shadow processes repeatedly opened `request.json`. Windows can briefly deny replacement while a reader has the destination open.
+
+The request channel is **latest-value**, not FIFO. Therefore a transient publish conflict must not terminate or stall the authoritative plant.
+
+The IPC writer now:
+
+1. uses a unique temporary filename for each publish attempt,
+2. retries `os.replace()` only for a few milliseconds on `PermissionError`,
+3. drops that one publication if the sharing conflict persists,
+4. lets the next generation supersede it.
+
+An exhausted request publication is reported as:
+
+```text
+IPC backpressure: dropped planner snapshot generation=N after transient Windows sharing conflicts
+```
+
+Dropping an occasional planner snapshot is valid under the V11 contract; stopping Mario is not.
+
+## Current acceptance focus
+
+The concurrency contract now has machine evidence. The next run should verify that the Windows IPC fix prevents `PermissionError` from terminating authority. After that, the main research problem moves back to live policy quality and horizon design.
 
 ## Failure signals
 
@@ -94,9 +126,12 @@ The following indicate architecture problems rather than ordinary policy failure
 - no `control update:` arrives before bootstrap reaches the first hazard,
 - plan age repeatedly exceeds the freshness window,
 - terminal output appears but the parent process does not return,
+- a transient Windows IPC sharing conflict terminates authority,
 - a shadow process touches the authoritative Mesen home or machine instance,
 - an authoritative game event is inferred from a shadow candidate rather than real execution.
 
 ## Authority invariant
 
 The authoritative process must never load a counterfactual state. Only shadow workers restore and roll out snapshots.
+
+Authoritative `DIED` and `LEVEL_COMPLETED` remain derived from the real Mesen trajectory.
