@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""V8 branch-governed wrapper around the V7 B-aware planner.
+"""Fast, observable V8 wrapper around the V7 B-aware SMB1 planner.
 
-V7 proved that the richer B-aware control space is useful, but its precision
-beam expands all 27 short primitives at every node. V8 keeps all immediate
-probes, then limits only deeper beam branching.
+V8 keeps Mesen as machine authority, but trims research-time overhead for live
+runs: candidate endpoint captures are disabled by default, safe high-progress
+coarse ties bypass precision search, and precision beam search uses a bounded
+4-way / depth-2 budget. ``--full-search`` restores the previous exhaustive V8
+behavior for audit runs.
 
-Optional ``--web-ui`` observability is strictly authoritative: candidate/beam
-rollouts remain hidden, while only the selected action replay publishes sampled
-NES frames and telemetry to a localhost browser viewer. Sampling never sleeps or
-paces the authoritative emulator loop.
+``--web-ui`` remains observer-only: only authoritative committed frames are
+sampled and published. Counterfactual rollouts stay headless.
 """
 
 from __future__ import annotations
@@ -37,7 +37,11 @@ import mesen_smb_checkpoint_planner_v6 as v6
 import mesen_smb_checkpoint_planner_v7 as v7
 
 
-PRECISION_SHORTLIST_LIMIT = 6
+PRECISION_SHORTLIST_LIMIT = 4
+FAST_PROGRESS_THRESHOLD = 60
+FAST_PRECISION_DEPTH = 2
+FAST_PRECISION_WIDTH = 4
+CAPTURE_AUDIT_INTERVAL = 10
 MANDATORY_FORWARD_FAMILIES = (
     "right_a_b",
     "right_b",
@@ -54,6 +58,9 @@ _NES_NOMINAL_FPS = 60.0
 _original_evaluate_candidates = v6.evaluate_candidates
 _original_beam_search = v6.beam_search
 _original_select_immediate = v6.select_immediate
+_original_precision_trigger = v6.precision_trigger
+_original_capture_authoritative = v6.capture_authoritative
+
 _last_precision_results = None
 _last_selection_mode = "B-AWARE COARSE FAST"
 _web_viewer: NesWebViewer | None = None
@@ -61,6 +68,7 @@ _web_fps = 15.0
 _web_sample_stride = 4
 _commit_decision = 0
 _commit_frame_index = 0
+_full_search = False
 
 
 def _timestamp() -> str:
@@ -125,11 +133,42 @@ def precision_shortlist(results, limit: int = PRECISION_SHORTLIST_LIMIT):
 
 
 def evaluate_candidates(*args, **kwargs):
+    """Evaluate candidates without per-endpoint save-state capture in fast mode."""
     global _last_precision_results
+    if not _full_search:
+        kwargs["capture_dir"] = None
     results = _original_evaluate_candidates(*args, **kwargs)
     if kwargs.get("mode") == "precision":
         _last_precision_results = results
     return results
+
+
+def capture_authoritative(state_file, capture_dir, decision, frame, x):
+    """Keep sparse durable witnesses instead of copying/hashing every decision."""
+    if _full_search or decision == 1 or decision % CAPTURE_AUDIT_INTERVAL == 0:
+        return _original_capture_authoritative(
+            state_file, capture_dir, decision, frame, x
+        )
+    return None
+
+
+def precision_trigger(results):
+    """Skip expensive precision search on clearly healthy high-progress coarse ties."""
+    reason = _original_precision_trigger(results)
+    if _full_search or reason != "state-divergent-progress-tie":
+        return reason
+
+    safe = [e for e in results if e.outcome.terminal == CandidateTerminal.NONE]
+    if not safe:
+        return reason
+    best_progress = max(e.outcome.progress for e in safe)
+    if best_progress >= FAST_PROGRESS_THRESHOLD:
+        print(
+            f"V8 fast gate: coarse progress={best_progress:+d}; precision search skipped",
+            flush=True,
+        )
+        return None
+    return reason
 
 
 def select_immediate(results):
@@ -160,17 +199,24 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
 
     shortlist_results = precision_shortlist(_last_precision_results)
     shortlist = tuple(e.outcome.candidate for e in shortlist_results)
-    shortlist_width = min(width, len(shortlist))
+    if _full_search:
+        effective_depth = depth
+        effective_width = min(width, len(shortlist))
+    else:
+        effective_depth = min(depth, FAST_PRECISION_DEPTH)
+        effective_width = min(width, FAST_PRECISION_WIDTH, len(shortlist))
+
     try:
         root_name, logs = _original_beam_search(
             core, shortlist, root_file, root_frame, root_x, root_engine,
-            root_observation, timeout_s, depth, shortlist_width, "v8-precision",
+            root_observation, timeout_s, effective_depth, effective_width,
+            "v8-precision",
         )
     except Exception as exc:
         names = ", ".join(e.outcome.candidate.name for e in shortlist_results)
         print(
             f"V8 beam error: tag=v8-precision root_frame={root_frame} X={root_x} "
-            f"depth={depth} width={shortlist_width} shortlist=[{names}] "
+            f"depth={effective_depth} width={effective_width} shortlist=[{names}] "
             f"error={type(exc).__name__}: {exc}",
             flush=True,
         )
@@ -179,14 +225,15 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
     _last_selection_mode = "B-AWARE PRECISION"
     names = ", ".join(e.outcome.candidate.name for e in shortlist_results)
     prefix = (
-        f"  V8 branch governor: {len(candidates)} -> {len(shortlist)} precision families/states",
+        f"  V8 branch governor: {len(candidates)} -> {len(shortlist)}; "
+        f"beam depth={effective_depth} width={effective_width}",
         f"  V8 shortlist: {names}",
     )
     return root_name, prefix + logs
 
 
 def _observed_commit_candidate(core, candidate, start_observation, episode, timeout_s):
-    """Replay the selected candidate and sample authoritative frames without pacing it."""
+    """Replay selected candidate and sample authoritative frames without pacing it."""
     global _commit_decision, _commit_frame_index
     _commit_decision += 1
     previous = start_observation
@@ -237,17 +284,25 @@ def _observed_commit_candidate(core, candidate, start_observation, episode, time
     return previous, terminal, reached_flagpole
 
 
-def _consume_web_args() -> tuple[bool, int, float]:
-    """Remove V8-only web flags before V7 argparse sees argv."""
+def _consume_v8_args() -> tuple[bool, int, float, bool]:
+    """Remove V8-only flags before V7 argparse sees argv."""
     enabled = False
     port = 8765
     fps = 15.0
+    full_search = False
     cleaned = [sys.argv[0]]
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
         if arg == "--web-ui":
             enabled = True
+            i += 1
+            continue
+        if arg == "--full-search":
+            full_search = True
+            i += 1
+            continue
+        if arg == "--verbose-log":
             i += 1
             continue
         if arg == "--web-port":
@@ -275,15 +330,18 @@ def _consume_web_args() -> tuple[bool, int, float]:
     if fps <= 0:
         raise ValueError("--web-fps must be > 0")
     sys.argv[:] = cleaned
-    return enabled, port, fps
+    return enabled, port, fps, full_search
 
 
 def main() -> int:
-    global _web_viewer, _web_fps, _web_sample_stride
+    global _web_viewer, _web_fps, _web_sample_stride, _full_search
 
-    web_enabled, web_port, _web_fps = _consume_web_args()
+    web_enabled, web_port, _web_fps, _full_search = _consume_v8_args()
     _web_sample_stride = max(1, round(_NES_NOMINAL_FPS / _web_fps))
+
     v6.evaluate_candidates = evaluate_candidates
+    v6.capture_authoritative = capture_authoritative
+    v6.precision_trigger = precision_trigger
     v6.beam_search = beam_search
     v6.select_immediate = select_immediate
 
@@ -292,23 +350,24 @@ def main() -> int:
         _web_viewer.start()
         v7.commit_candidate = _observed_commit_candidate
         print(f"Web UI    : {_web_viewer.url}", flush=True)
-        print(
-            "Web scope : authoritative commits only; beam rollouts hidden; "
-            f"sampling~{_NES_NOMINAL_FPS / _web_sample_stride:.1f} fps "
-            f"(every {_web_sample_stride} committed frames, no playback sleep)",
-            flush=True,
-        )
         try:
             webbrowser.open(_web_viewer.url, new=2)
         except Exception:
             pass
 
-    print("=== Planner V8: bounded B-aware precision branching ===", flush=True)
+    profile = "FULL" if _full_search else "FAST"
     print(
-        f"Precision branch governor: immediate probes stay at {len(v7.PRECISION_CANDIDATES)}, "
-        f"deep beam shortlist <= {PRECISION_SHORTLIST_LIMIT}",
+        f"Planner V8: profile={profile} web-sample~"
+        f"{_NES_NOMINAL_FPS / _web_sample_stride:.1f}fps",
         flush=True,
     )
+    if not _full_search:
+        print(
+            f"V8 fast search: coarse-tie gate >= {FAST_PROGRESS_THRESHOLD}px; "
+            f"precision beam <= {PRECISION_SHORTLIST_LIMIT}x{FAST_PRECISION_DEPTH}; "
+            f"captures every {CAPTURE_AUDIT_INTERVAL} decisions",
+            flush=True,
+        )
     return v7.main()
 
 
@@ -348,13 +407,48 @@ def _terminate_worker(proc: subprocess.Popen[str]) -> None:
 def _print_timestamped(line: str) -> None:
     if line.strip():
         print(f"[{_timestamp()}] {line}", end="", flush=True)
-    else:
-        print(line, end="", flush=True)
+
+
+def _compact_log_line(line: str) -> bool:
+    """Keep operational telemetry; the browser now carries play-by-play detail."""
+    s = line.strip()
+    if not s:
+        return False
+    prefixes = (
+        "Web UI",
+        "Planner V8:",
+        "V8 fast search:",
+        "DLL",
+        "ROM",
+        "Init",
+        "NesConfig",
+        "LoadRom",
+        "Debugger",
+        "TitleMenu",
+        "GameEntry",
+        "FixtureSync",
+        "Fixture   :",
+        "StateLoad",
+        "Decision #",
+        "CONTROL ALERT",
+        "V8 fast gate:",
+        "V8 branch governor:",
+        "Beam choice:",
+        "Selected action:",
+        "Decision mode",
+        "Committed state:",
+        "=== LEVEL COMPLETE",
+        "PlannerV7:",
+        "V8 beam error:",
+        "[CPU]",
+    )
+    return s.startswith(prefixes)
 
 
 def _supervise() -> int:
     env = os.environ.copy()
     env[_WORKER_ENV] = "1"
+    verbose = "--verbose-log" in sys.argv[1:]
     cmd = [sys.executable, "-u", str(__file__), *sys.argv[1:]]
     proc = subprocess.Popen(
         cmd,
@@ -369,6 +463,7 @@ def _supervise() -> int:
     lines: queue.Queue[str | None] = queue.Queue()
     threading.Thread(target=_reader, args=(proc.stdout, lines), daemon=True).start()
     last_output = time.monotonic()
+    traceback_mode = False
 
     while True:
         try:
@@ -390,8 +485,13 @@ def _supervise() -> int:
             return proc.wait()
 
         last_output = time.monotonic()
-        _print_timestamped(item)
-        code = _result_code(item.strip())
+        stripped = item.strip()
+        if stripped.startswith("Traceback (most recent call last):"):
+            traceback_mode = True
+        if verbose or traceback_mode or _compact_log_line(item):
+            _print_timestamped(item)
+
+        code = _result_code(stripped)
         if code is None:
             continue
 
