@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from array import array
+from collections import deque
 import json
 import struct
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fami_pixel.adapters.mesen import copy_nes_raw_frame
@@ -31,14 +34,8 @@ _NES_RGB = (
 )
 
 
-def raw_frame_to_bmp(frame) -> bytes:
-    """Convert a canonical raw NES frame to a browser-friendly 24-bit BMP.
-
-    Emphasis bits are intentionally not interpreted yet; the browser surface is
-    human observability, while the raw Mesen framebuffer remains authoritative.
-    """
-    width = frame.width
-    height = frame.height
+def _packed_frame_to_bmp(width: int, height: int, packed_pixels: bytes) -> bytes:
+    """Convert packed uint16 NES pixels to a browser-friendly 24-bit BMP."""
     row_stride = (width * 3 + 3) & ~3
     image_size = row_stride * height
     offset = 14 + 40
@@ -62,17 +59,25 @@ def raw_frame_to_bmp(frame) -> bytes:
         0,
     )
 
+    words = memoryview(packed_pixels).cast("H")
     pixels = bytearray(image_size)
     out = 0
     for y in range(height - 1, -1, -1):
         row = y * width
         for x in range(width):
-            raw = frame.pixels[row + x]
+            raw = words[row + x]
             r, g, b = _NES_RGB[raw & 0x3F]
-            pixels[out : out + 3] = bytes((b, g, r))
+            pixels[out] = b
+            pixels[out + 1] = g
+            pixels[out + 2] = r
             out += 3
         out += row_stride - width * 3
     return bytes(header + pixels)
+
+
+def raw_frame_to_bmp(frame) -> bytes:
+    packed = array("H", frame.pixels).tobytes()
+    return _packed_frame_to_bmp(frame.width, frame.height, packed)
 
 
 _HTML = r"""<!doctype html>
@@ -85,52 +90,26 @@ _HTML = r"""<!doctype html>
 :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 * { box-sizing: border-box; }
 body { margin: 0; background: #111; color: #eee; }
-main {
-  width: min(100% - 32px, 1160px);
-  margin: 24px auto;
-  display: grid;
-  grid-template-columns: minmax(0, 768px) 320px;
-  align-items: start;
-  justify-content: center;
-  gap: 18px;
-}
+main { width: min(100% - 32px, 1160px); margin: 24px auto; display: grid; grid-template-columns: minmax(0, 768px) 320px; align-items: start; justify-content: center; gap: 18px; }
 .card { background: #1b1b1b; border: 1px solid #333; border-radius: 12px; padding: 14px; }
 .game-card { width: 100%; }
-#frame-wrap {
-  width: min(100%, 768px);
-  aspect-ratio: 256 / 240;
-  margin: 0 auto;
-  background: #000;
-  overflow: hidden;
-}
-#frame {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  image-rendering: pixelated;
-  display: block;
-}
+#frame-wrap { width: min(100%, 768px); aspect-ratio: 256 / 240; margin: 0 auto; background: #000; overflow: hidden; }
+#frame { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; display: block; }
 h1 { margin: 0 0 12px; font-size: 18px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
 .k { color: #999; }
 .v { text-align: right; }
 #action { font-size: 18px; margin: 8px 0 14px; }
 #status { margin-top: 12px; color: #aaa; font-size: 12px; }
-@media (max-width: 1120px) {
-  main { grid-template-columns: minmax(0, 640px) 300px; }
-}
-@media (max-width: 850px) {
-  main { width: min(100% - 20px, 640px); grid-template-columns: 1fr; margin: 10px auto; }
-}
+@media (max-width: 1120px) { main { grid-template-columns: minmax(0, 640px) 300px; } }
+@media (max-width: 850px) { main { width: min(100% - 20px, 640px); grid-template-columns: 1fr; margin: 10px auto; } }
 </style>
 </head>
 <body>
 <main>
   <section class="card game-card">
     <h1>Fami Pixel / SMB1 — authoritative trajectory</h1>
-    <div id="frame-wrap">
-      <img id="frame" alt="NES authoritative framebuffer">
-    </div>
+    <div id="frame-wrap"><img id="frame" alt="NES authoritative framebuffer"></div>
   </section>
   <aside class="card">
     <div class="k">Committed action</div>
@@ -144,8 +123,9 @@ h1 { margin: 0 0 12px; font-size: 18px; }
       <div class="k">VX</div><div class="v" id="vx">-</div>
       <div class="k">VY</div><div class="v" id="vy">-</div>
       <div class="k">Engine</div><div class="v" id="engine">-</div>
+      <div class="k">Playback buffer</div><div class="v" id="buffered">-</div>
     </div>
-    <div id="status">local observer; counterfactual rollouts are hidden</div>
+    <div id="status">buffered authoritative playback; counterfactual rollouts are hidden</div>
   </aside>
 </main>
 <script>
@@ -156,14 +136,14 @@ async function tick() {
     const s = await r.json();
     if (s.version !== version) {
       version = s.version;
-      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine']) {
+      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','buffered']) {
         const el = document.getElementById(k);
         if (el) el.textContent = s[k] ?? '-';
       }
       if (s.has_frame) document.getElementById('frame').src = '/frame.bmp?v=' + version;
     }
   } catch (_) {}
-  setTimeout(tick, 33);
+  setTimeout(tick, 25);
 }
 tick();
 </script>
@@ -172,16 +152,28 @@ tick();
 
 
 class NesWebViewer:
-    """Small localhost-only HTTP observer with a latest-frame snapshot model."""
+    """Local browser observer with buffered authoritative playback.
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8765):
+    Producers enqueue committed emulator frames as fast as the planner executes
+    them. A separate playback thread exposes those frames at a steady human-view
+    cadence, so commit bursts no longer appear as jerky browser motion and the
+    planner is never paced by the UI.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765, playback_fps: float = 15.0):
         if host not in {"127.0.0.1", "localhost"}:
             raise ValueError("NesWebViewer is local-only; bind to 127.0.0.1/localhost")
+        if playback_fps <= 0:
+            raise ValueError("playback_fps must be > 0")
         self.host = host
         self.port = int(port)
+        self.playback_fps = float(playback_fps)
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._version = 0
         self._frame = b""
+        self._queue = deque(maxlen=240)
+        self._stopping = False
         self._state = {
             "version": 0,
             "has_frame": False,
@@ -194,9 +186,11 @@ class NesWebViewer:
             "vx": None,
             "vy": None,
             "engine": None,
+            "buffered": 0,
         }
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._playback_thread: threading.Thread | None = None
 
     @property
     def url(self) -> str:
@@ -240,32 +234,67 @@ class NesWebViewer:
         self.port = int(self._server.server_address[1])
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
+
+    def _playback_loop(self) -> None:
+        interval = 1.0 / self.playback_fps
+        next_tick = time.monotonic()
+        while True:
+            with self._condition:
+                while not self._queue and not self._stopping:
+                    self._condition.wait(timeout=0.25)
+                    next_tick = time.monotonic()
+                if self._stopping:
+                    return
+                width, height, packed, state = self._queue.popleft()
+                buffered = len(self._queue)
+
+            bmp = _packed_frame_to_bmp(width, height, packed)
+            with self._lock:
+                self._version += 1
+                self._frame = bmp
+                state["version"] = self._version
+                state["has_frame"] = True
+                state["buffered"] = buffered
+                self._state = state
+
+            next_tick += interval
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tick = time.monotonic()
 
     def publish_core(self, core, observation, *, decision: int, mode: str, action: str) -> None:
         frame = copy_nes_raw_frame(core)
-        bmp = raw_frame_to_bmp(frame)
+        packed = array("H", frame.pixels).tobytes()
         vx = observation.player_x_speed
         vy = observation.player_y_speed
         vx = vx - 256 if vx >= 128 else vx
         vy = vy - 256 if vy >= 128 else vy
-        with self._lock:
-            self._version += 1
-            self._frame = bmp
-            self._state = {
-                "version": self._version,
-                "has_frame": True,
-                "decision": decision,
-                "mode": mode,
-                "action": action,
-                "native_frame": observation.native_frame_id,
-                "x": observation.mario_x_abs,
-                "y": observation.mario_y,
-                "vx": vx,
-                "vy": vy,
-                "engine": f"0x{observation.game_engine_subroutine:02X}",
-            }
+        state = {
+            "version": 0,
+            "has_frame": True,
+            "decision": decision,
+            "mode": mode,
+            "action": action,
+            "native_frame": observation.native_frame_id,
+            "x": observation.mario_x_abs,
+            "y": observation.mario_y,
+            "vx": vx,
+            "vy": vy,
+            "engine": f"0x{observation.game_engine_subroutine:02X}",
+            "buffered": 0,
+        }
+        with self._condition:
+            self._queue.append((frame.width, frame.height, packed, state))
+            self._condition.notify()
 
     def stop(self) -> None:
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
