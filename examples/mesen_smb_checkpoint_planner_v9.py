@@ -4,11 +4,11 @@
 V8 is efficient on open terrain but can get trapped immediately against a tall
 pipe: all short precision primitives report zero forward progress, so the
 planner keeps committing tiny RIGHT+A+B actions without creating enough jump
-height or run-up distance. V9 keeps the V8 fast path and adds a small set of
-long-horizon recovery macros only when V8 reports ``no-forward-progress``.
+height or run-up distance. V9 keeps the V8 fast path and probes a tiny set of
+long-horizon recovery macros first when V8 reports ``no-forward-progress``.
 
-Mesen remains the machine authority. Recovery candidates are still evaluated as
-counterfactual save-state rollouts; only the selected root candidate is committed.
+Mesen remains the machine authority. Recovery candidates are counterfactual
+save-state rollouts; only the selected root candidate is committed.
 """
 
 from __future__ import annotations
@@ -80,44 +80,55 @@ def _timestamp() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+def _evaluate_only(args, kwargs, candidates):
+    local_args = list(args)
+    local_args[1] = tuple(candidates)
+    return _original_v8_evaluate(*local_args, **kwargs)
+
+
 def evaluate_candidates(*args, **kwargs):
-    """Inject long obstacle-recovery macros only after a no-progress trigger."""
+    """Probe only the three recovery macros first on a no-progress state.
+
+    If one proves safe forward progress, return those recovery outcomes directly
+    and skip the 27 short precision probes entirely. Only if recovery fails do we
+    fall back to the original short precision search.
+    """
     mode = kwargs.get("mode")
     if (
         not v8._full_search
         and mode == "precision"
         and v8._last_precision_reason == "no-forward-progress"
     ):
-        local_args = list(args)
-        base_candidates = tuple(local_args[1])
-        known = {c.name for c in base_candidates}
-        local_args[1] = base_candidates + tuple(
-            c for c in RECOVERY_CANDIDATES if c.name not in known
-        )
-        results = _original_v8_evaluate(*local_args, **kwargs)
-        best_recovery = max(
-            (
-                e for e in results
-                if e.outcome.candidate.name in RECOVERY_NAMES
-                and e.outcome.terminal == CandidateTerminal.NONE
-            ),
-            key=v8._rank,
-            default=None,
-        )
-        if best_recovery is not None:
+        recovery = _evaluate_only(args, kwargs, RECOVERY_CANDIDATES)
+        v8._last_precision_results = recovery
+        safe_recovery = [
+            e for e in recovery
+            if e.outcome.terminal == CandidateTerminal.NONE and e.outcome.progress > 0
+        ]
+        if safe_recovery:
+            best = max(safe_recovery, key=v8._rank)
             print(
                 "V9 recovery probe: "
-                f"best={v7.action_label(best_recovery.outcome.candidate.name)} "
-                f"progress={best_recovery.outcome.progress:+d}",
+                f"best={v7.action_label(best.outcome.candidate.name)} "
+                f"progress={best.outcome.progress:+d}; short precision skipped",
                 flush=True,
             )
-        return results
+            return recovery
+
+        print(
+            "V9 recovery probe: no safe forward macro; falling back to short precision",
+            flush=True,
+        )
+        precision = _original_v8_evaluate(*args, **kwargs)
+        v8._last_precision_results = precision
+        return precision
+
     return _original_v8_evaluate(*args, **kwargs)
 
 
 def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
                 root_observation, timeout_s, depth, width, tag):
-    """Prefer a proven forward-moving recovery macro before another short beam."""
+    """Select a proven recovery macro without another beam expansion."""
     if (
         not v8._full_search
         and tag == "v7-precision"
@@ -134,7 +145,7 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
             chosen = max(safe_recovery, key=v8._rank)
             v8._last_selection_mode = "B-AWARE STUCK RECOVERY"
             return chosen.outcome.candidate.name, (
-                "  V9 stuck recovery: short precision made no progress; long macro selected",
+                "  V9 stuck recovery: recovery macro proved forward progress; beam skipped",
                 f"  Beam choice: {v7.action_label(chosen.outcome.candidate.name)} | "
                 f"projected progress={chosen.outcome.progress:+d} | status=SAFE",
             )
@@ -153,16 +164,17 @@ def main() -> int:
 
 
 def _result_code(line: str) -> int | None:
-    if not line.startswith(_RESULT_PREFIX):
-        return None
-    if "PASS" in line:
-        return 0
-    if "FAIL death" in line:
-        return 6
-    if "FAIL decision limit" in line:
-        return 7
-    if "FAIL" in line:
-        return 1
+    if line.startswith(_RESULT_PREFIX):
+        if "PASS" in line:
+            return 0
+        if "FAIL death" in line:
+            return 6
+        if "FAIL decision limit" in line:
+            return 7
+        if "FAIL" in line:
+            return 1
+    if "MesenLoadError:" in line and "FamiPixelStepFrame failed" in line:
+        return 4
     return None
 
 
@@ -272,6 +284,15 @@ def _supervise() -> int:
         code = _result_code(stripped)
         if code is None:
             continue
+
+        if code == 4:
+            print(
+                f"[{_timestamp()}] V9 supervisor: native frame-step failure observed; "
+                "terminating failed worker immediately.",
+                flush=True,
+            )
+            _terminate_worker(proc)
+            return code
 
         try:
             proc.wait(timeout=_POST_RESULT_GRACE_S)
