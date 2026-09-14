@@ -9,8 +9,9 @@ FAST mode is deliberately adaptive:
 - imminent falling/all-terminal hazards get a larger 6-way/depth-3 budget.
 
 ``--full-search`` restores the V7/V8 research-heavy behavior. ``--web-ui`` is
-observer-only: only authoritative committed frames are sampled; counterfactual
-rollouts remain headless and never pace emulator execution.
+observer-only: every authoritative committed frame is queued for a separate
+steady-rate browser playback thread; counterfactual rollouts remain headless and
+never pace emulator execution.
 """
 
 from __future__ import annotations
@@ -75,7 +76,7 @@ _last_precision_reason: str | None = None
 _last_selection_mode = "B-AWARE COARSE FAST"
 _web_viewer: NesWebViewer | None = None
 _web_fps = 15.0
-_web_sample_stride = 4
+_web_sample_stride = 1
 _commit_decision = 0
 _commit_frame_index = 0
 _full_search = False
@@ -312,7 +313,7 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
 
 
 def _observed_commit_candidate(core, candidate, start_observation, episode, timeout_s):
-    """Replay selected candidate and sample authoritative frames without pacing it."""
+    """Replay selected candidate and enqueue every authoritative frame for UI playback."""
     global _commit_decision, _commit_frame_index
     _commit_decision += 1
     previous = start_observation
@@ -334,11 +335,8 @@ def _observed_commit_candidate(core, candidate, start_observation, episode, time
 
             level_complete = any(event.kind == GameEventType.LEVEL_COMPLETED for event in events)
             died = any(event.kind == GameEventType.DIED for event in events)
-            terminal_now = level_complete or died
 
-            if _web_viewer is not None and (
-                _commit_frame_index % _web_sample_stride == 0 or terminal_now
-            ):
+            if _web_viewer is not None:
                 _web_viewer.publish_core(
                     core,
                     current,
@@ -420,7 +418,7 @@ def main() -> int:
     global _web_viewer, _web_fps, _web_sample_stride, _full_search
 
     web_enabled, web_port, _web_fps, _full_search = _consume_v8_args()
-    _web_sample_stride = max(1, round(_NES_NOMINAL_FPS / _web_fps))
+    _web_sample_stride = 1
 
     v6.evaluate_candidates = evaluate_candidates
     v6.capture_authoritative = capture_authoritative
@@ -429,7 +427,7 @@ def main() -> int:
     v6.select_immediate = select_immediate
 
     if web_enabled:
-        _web_viewer = NesWebViewer(port=web_port)
+        _web_viewer = NesWebViewer(port=web_port, playback_fps=_web_fps)
         _web_viewer.start()
         v7.commit_candidate = _observed_commit_candidate
         print(f"Web UI    : {_web_viewer.url}", flush=True)
@@ -440,8 +438,8 @@ def main() -> int:
 
     profile = "FULL" if _full_search else "FAST"
     print(
-        f"Planner V8: profile={profile} web-sample~"
-        f"{_NES_NOMINAL_FPS / _web_sample_stride:.1f}fps",
+        f"Planner V8: profile={profile} web-playback={_web_fps:.1f}fps "
+        "authoritative-frame-buffer=ON",
         flush=True,
     )
     if not _full_search:
