@@ -45,11 +45,11 @@ function Get-PortableVsLayout {
     $SdkIncludeRoot = Join-Path $SdkRoot "Include"
     $SdkVersionDir = Get-ChildItem -Path $SdkIncludeRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object {
-            Test-Path (Join-Path $_.FullName "um\Windows.h") -and
-            Test-Path (Join-Path $_.FullName "shared\SDKDDKVer.h") -and
-            Test-Path (Join-Path $_.FullName "ucrt\stdio.h") -and
-            Test-Path (Join-Path $_.FullName "winrt\wrl.h") -and
-            Test-Path (Join-Path $_.FullName "winrt\wrl\client.h")
+            (Test-Path (Join-Path $_.FullName "um\Windows.h")) -and
+            (Test-Path (Join-Path $_.FullName "shared\SDKDDKVer.h")) -and
+            (Test-Path (Join-Path $_.FullName "ucrt\stdio.h")) -and
+            (Test-Path (Join-Path $_.FullName "winrt\wrl.h")) -and
+            (Test-Path (Join-Path $_.FullName "winrt\wrl\client.h"))
         } |
         Sort-Object Name -Descending |
         Select-Object -First 1
@@ -84,16 +84,16 @@ function Test-PortableVsLayout {
     )
 
     $Checks = [ordered]@{
-        "cl.exe"                     = $Layout.Cl
-        "MSBuild.exe"                = $Layout.MSBuild
+        "cl.exe"                      = $Layout.Cl
+        "MSBuild.exe"                 = $Layout.MSBuild
         "Microsoft.Cpp.Default.props" = $Layout.CppDefaultProps
         "Microsoft.Cpp.props"         = $Layout.CppProps
         "Microsoft.Cpp.targets"       = $Layout.CppTargets
         "vcvars-x64-x64.bat"          = $Layout.VcVars
-        "SDK Lib"                      = $Layout.SdkLib
-        "SDK Bin x64"                  = $Layout.SdkBin
+        "SDK Lib"                     = $Layout.SdkLib
+        "SDK Bin x64"                 = $Layout.SdkBin
         "winrt\wrl.h"                 = $Layout.WinRTWrl
-        "winrt\wrl\client.h"          = $Layout.WinRTClient
+        "winrt\wrl\client.h"         = $Layout.WinRTClient
     }
 
     $AllPass = $true
