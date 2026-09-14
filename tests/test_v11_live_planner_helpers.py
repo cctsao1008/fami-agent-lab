@@ -22,6 +22,12 @@ def test_candidate_shards_cover_pool_without_overlap():
     assert all(shard for shard in shards)
 
 
+def test_live_candidate_pool_is_short_horizon():
+    pool = v11._candidate_pool()
+    assert tuple(candidate.name for candidate in pool) == v11.LIVE_CANDIDATE_NAMES
+    assert max(candidate.frame_count for candidate in pool) <= 12
+
+
 def test_best_fresh_plan_prefers_newest_root_then_score(tmp_path):
     responses = [tmp_path / "r0.json", tmp_path / "r1.json"]
     v11._atomic_json(
@@ -29,8 +35,8 @@ def test_best_fresh_plan_prefers_newest_root_then_score(tmp_path):
         {
             "generation": 2,
             "root_frame": 100,
-            "candidate": "run_long_jump",
-            "schedule": [{"buttons": 1, "frames": 24}, {"buttons": 2, "frames": 6}],
+            "candidate": "right_a_b_12",
+            "schedule": [{"buttons": 0x83, "frames": 12}],
             "score": [1, 0, 90, 190],
         },
     )
@@ -39,15 +45,15 @@ def test_best_fresh_plan_prefers_newest_root_then_score(tmp_path):
         {
             "generation": 3,
             "root_frame": 104,
-            "candidate": "run",
-            "schedule": [{"buttons": 2, "frames": 30}],
+            "candidate": "right_b_8",
+            "schedule": [{"buttons": 0x82, "frames": 8}],
             "score": [1, 0, 40, 144],
         },
     )
 
     plan = v11._best_fresh_plan(responses, current_frame=108, freshness=8, last_applied_generation=-1)
     assert plan is not None
-    assert plan["candidate"] == "run"
+    assert plan["candidate"] == "right_b_8"
     assert plan["age"] == 4
 
 
@@ -58,8 +64,8 @@ def test_best_fresh_plan_rejects_stale_and_already_applied(tmp_path):
         {
             "generation": 2,
             "root_frame": 90,
-            "candidate": "run",
-            "schedule": [{"buttons": 1, "frames": 30}],
+            "candidate": "right_b_8",
+            "schedule": [{"buttons": 0x82, "frames": 8}],
             "score": [1, 0, 50, 140],
         },
     )
@@ -68,8 +74,8 @@ def test_best_fresh_plan_rejects_stale_and_already_applied(tmp_path):
         {
             "generation": 3,
             "root_frame": 104,
-            "candidate": "tap_jump",
-            "schedule": [{"buttons": 2, "frames": 6}, {"buttons": 3, "frames": 24}],
+            "candidate": "right_a_b_8",
+            "schedule": [{"buttons": 0x83, "frames": 8}],
             "score": [1, 0, 30, 134],
         },
     )
@@ -92,3 +98,14 @@ def test_schedule_buttons_tracks_multi_command_macro():
     assert v11._schedule_buttons(schedule, 6) == 0x82
     assert v11._schedule_buttons(schedule, 29) == 0x82
     assert v11._schedule_buttons(schedule, 40) == 0x82
+
+
+def test_schedule_buttons_can_repeat_bootstrap_cycle():
+    schedule = [
+        {"buttons": 0x83, "frames": 8},
+        {"buttons": 0x82, "frames": 8},
+    ]
+    assert v11._schedule_buttons(schedule, 0, repeat=True) == 0x83
+    assert v11._schedule_buttons(schedule, 8, repeat=True) == 0x82
+    assert v11._schedule_buttons(schedule, 16, repeat=True) == 0x83
+    assert v11._schedule_buttons(schedule, 24, repeat=True) == 0x82
