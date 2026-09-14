@@ -45,13 +45,15 @@ function Quote-ProcessArgument {
     return '"' + ($Value -replace '"', '\"') + '"'
 }
 
-function Show-SmokeLogs {
-    if (Test-Path $SmokeStdout) {
-        Get-Content -Path $SmokeStdout
-    }
-    if (Test-Path $SmokeStderr) {
-        Get-Content -Path $SmokeStderr
-    }
+function Read-LogLines {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Wrap the whole conditional in an array subexpression. In PowerShell,
+    # assigning the output of an `if` expression can collapse a one-line file
+    # to a scalar string even when Get-Content itself is wrapped in @(...).
+    # StrictMode then rejects `.Count` on that scalar. This guarantees the
+    # caller always receives an array, including zero- and one-line logs.
+    return @(if (Test-Path $Path) { Get-Content -Path $Path })
 }
 
 if ([string]::IsNullOrWhiteSpace($RomPath)) {
@@ -140,7 +142,7 @@ $LastStderrCount = 0
 while (-not $Process.HasExited -and -not $PassObserved) {
     Start-Sleep -Milliseconds 200
 
-    $StdoutLines = if (Test-Path $SmokeStdout) { @(Get-Content -Path $SmokeStdout) } else { @() }
+    $StdoutLines = @(Read-LogLines $SmokeStdout)
     if ($StdoutLines.Count -gt $LastStdoutCount) {
         $StdoutLines[$LastStdoutCount..($StdoutLines.Count - 1)] | ForEach-Object { Write-Host $_ }
         $LastStdoutCount = $StdoutLines.Count
@@ -150,7 +152,7 @@ while (-not $Process.HasExited -and -not $PassObserved) {
         break
     }
 
-    $StderrLines = if (Test-Path $SmokeStderr) { @(Get-Content -Path $SmokeStderr) } else { @() }
+    $StderrLines = @(Read-LogLines $SmokeStderr)
     if ($StderrLines.Count -gt $LastStderrCount) {
         $StderrLines[$LastStderrCount..($StderrLines.Count - 1)] | ForEach-Object { Write-Host $_ }
         $LastStderrCount = $StderrLines.Count
@@ -168,11 +170,11 @@ if ($PassObserved -and -not $Process.HasExited) {
 }
 
 # Flush any lines written after the last polling iteration.
-$StdoutLines = if (Test-Path $SmokeStdout) { @(Get-Content -Path $SmokeStdout) } else { @() }
+$StdoutLines = @(Read-LogLines $SmokeStdout)
 if ($StdoutLines.Count -gt $LastStdoutCount) {
     $StdoutLines[$LastStdoutCount..($StdoutLines.Count - 1)] | ForEach-Object { Write-Host $_ }
 }
-$StderrLines = if (Test-Path $SmokeStderr) { @(Get-Content -Path $SmokeStderr) } else { @() }
+$StderrLines = @(Read-LogLines $SmokeStderr)
 if ($StderrLines.Count -gt $LastStderrCount) {
     $StderrLines[$LastStderrCount..($StderrLines.Count - 1)] | ForEach-Object { Write-Host $_ }
 }
