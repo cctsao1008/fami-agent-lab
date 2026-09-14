@@ -12,8 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fami_pixel.adapters.mesen import copy_nes_raw_frame
 
-# A conventional 64-color NES palette approximation for human visualization.
-# Machine authority remains the raw uint16 framebuffer exposed by Mesen.
 _NES_RGB = (
     (84, 84, 84), (0, 30, 116), (8, 16, 144), (48, 0, 136),
     (68, 0, 100), (92, 0, 48), (84, 4, 0), (60, 24, 0),
@@ -35,7 +33,6 @@ _NES_RGB = (
 
 
 def _packed_frame_to_bmp(width: int, height: int, packed_pixels: bytes) -> bytes:
-    """Convert packed uint16 NES pixels to a browser-friendly 24-bit BMP."""
     row_stride = (width * 3 + 3) & ~3
     image_size = row_stride * height
     offset = 14 + 40
@@ -46,17 +43,7 @@ def _packed_frame_to_bmp(width: int, height: int, packed_pixels: bytes) -> bytes
     header += struct.pack("<IHHI", file_size, 0, 0, offset)
     header += struct.pack(
         "<IIIHHIIIIII",
-        40,
-        width,
-        height,
-        1,
-        24,
-        0,
-        image_size,
-        2835,
-        2835,
-        0,
-        0,
+        40, width, height, 1, 24, 0, image_size, 2835, 2835, 0, 0,
     )
 
     words = memoryview(packed_pixels).cast("H")
@@ -115,7 +102,7 @@ h1 { margin: 0 0 12px; font-size: 18px; }
     <div class="k">Applied action</div>
     <div id="action">waiting...</div>
     <div class="grid">
-      <div class="k">Decision</div><div class="v" id="decision">-</div>
+      <div class="k">Generation</div><div class="v" id="decision">-</div>
       <div class="k">Planner mode</div><div class="v" id="mode">-</div>
       <div class="k">Native frame</div><div class="v" id="native_frame">-</div>
       <div class="k">Mario X</div><div class="v" id="x">-</div>
@@ -125,6 +112,7 @@ h1 { margin: 0 0 12px; font-size: 18px; }
       <div class="k">Engine</div><div class="v" id="engine">-</div>
       <div class="k">Plan root frame</div><div class="v" id="plan_root_frame">-</div>
       <div class="k">Plan age</div><div class="v" id="plan_age">-</div>
+      <div class="k">Plan compute</div><div class="v" id="plan_compute_ms">-</div>
       <div class="k">Planner state</div><div class="v" id="planner_state">-</div>
       <div class="k">Playback buffer</div><div class="v" id="buffered">-</div>
     </div>
@@ -139,7 +127,7 @@ async function tick() {
     const s = await r.json();
     if (s.version !== version) {
       version = s.version;
-      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','planner_state','buffered']) {
+      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','plan_compute_ms','planner_state','buffered']) {
         const el = document.getElementById(k);
         if (el) el.textContent = s[k] ?? '-';
       }
@@ -185,6 +173,7 @@ class NesWebViewer:
             "engine": None,
             "plan_root_frame": None,
             "plan_age": None,
+            "plan_compute_ms": None,
             "planner_state": None,
             "buffered": 0,
         }
@@ -288,6 +277,7 @@ class NesWebViewer:
             "engine": f"0x{observation.game_engine_subroutine:02X}",
             "plan_root_frame": metadata.get("plan_root_frame"),
             "plan_age": metadata.get("plan_age"),
+            "plan_compute_ms": metadata.get("plan_compute_ms"),
             "planner_state": metadata.get("planner_state"),
             "buffered": 0,
         }
