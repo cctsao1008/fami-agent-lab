@@ -6,12 +6,14 @@ beam expands all 27 short primitives at every node. V8 keeps all immediate
 probes, then limits only deeper beam branching.
 
 Optional ``--web-ui`` observability is strictly authoritative: candidate/beam
-rollouts remain hidden, while only the selected action replay publishes NES
-frames and telemetry to a localhost browser viewer.
+rollouts remain hidden, while only the selected action replay publishes sampled
+NES frames and telemetry to a localhost browser viewer. Sampling never sleeps or
+paces the authoritative emulator loop.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import queue
 import subprocess
@@ -47,6 +49,7 @@ _WORKER_ENV = "FAMI_PIXEL_V8_WORKER"
 _RESULT_PREFIX = "PlannerV7:"
 _NO_OUTPUT_TIMEOUT_S = 180.0
 _POST_RESULT_GRACE_S = 1.0
+_NES_NOMINAL_FPS = 60.0
 
 _original_evaluate_candidates = v6.evaluate_candidates
 _original_beam_search = v6.beam_search
@@ -54,8 +57,14 @@ _original_select_immediate = v6.select_immediate
 _last_precision_results = None
 _last_selection_mode = "B-AWARE COARSE FAST"
 _web_viewer: NesWebViewer | None = None
-_web_fps = 30.0
+_web_fps = 15.0
+_web_sample_stride = 4
 _commit_decision = 0
+_commit_frame_index = 0
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
 def _family(name: str) -> str:
@@ -136,18 +145,37 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
     if tag != "v7-precision" or _last_precision_results is None:
         if tag == "v7-coarse":
             _last_selection_mode = "B-AWARE COARSE BEAM"
-        return _original_beam_search(
-            core, candidates, root_file, root_frame, root_x, root_engine,
-            root_observation, timeout_s, depth, width, tag,
-        )
+        try:
+            return _original_beam_search(
+                core, candidates, root_file, root_frame, root_x, root_engine,
+                root_observation, timeout_s, depth, width, tag,
+            )
+        except Exception as exc:
+            print(
+                f"V8 beam error: tag={tag} root_frame={root_frame} X={root_x} "
+                f"depth={depth} width={width} error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise
 
     shortlist_results = precision_shortlist(_last_precision_results)
     shortlist = tuple(e.outcome.candidate for e in shortlist_results)
     shortlist_width = min(width, len(shortlist))
-    root_name, logs = _original_beam_search(
-        core, shortlist, root_file, root_frame, root_x, root_engine,
-        root_observation, timeout_s, depth, shortlist_width, "v8-precision",
-    )
+    try:
+        root_name, logs = _original_beam_search(
+            core, shortlist, root_file, root_frame, root_x, root_engine,
+            root_observation, timeout_s, depth, shortlist_width, "v8-precision",
+        )
+    except Exception as exc:
+        names = ", ".join(e.outcome.candidate.name for e in shortlist_results)
+        print(
+            f"V8 beam error: tag=v8-precision root_frame={root_frame} X={root_x} "
+            f"depth={depth} width={shortlist_width} shortlist=[{names}] "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
+
     _last_selection_mode = "B-AWARE PRECISION"
     names = ", ".join(e.outcome.candidate.name for e in shortlist_results)
     prefix = (
@@ -158,18 +186,18 @@ def beam_search(core, candidates, root_file, root_frame, root_x, root_engine,
 
 
 def _observed_commit_candidate(core, candidate, start_observation, episode, timeout_s):
-    """Replay only the selected candidate while publishing authoritative frames."""
-    global _commit_decision
+    """Replay the selected candidate and sample authoritative frames without pacing it."""
+    global _commit_decision, _commit_frame_index
     _commit_decision += 1
     previous = start_observation
     reached_flagpole = previous.game_engine_subroutine == base.FLAGPOLE_SLIDE
     terminal = CandidateTerminal.NONE
-    delay = 1.0 / _web_fps if _web_fps > 0 else 0.0
 
     for command in candidate.commands:
         base.set_nes_controller_state(core, 0, command.nes_buttons)
         for _ in range(command.frame_count):
             base.step(core, timeout_s)
+            _commit_frame_index += 1
             state = read_smb1_state(core)
             current = observation_from_state(core.frame_count(), state)
             events = derive_game_events(previous, current)
@@ -178,7 +206,15 @@ def _observed_commit_candidate(core, candidate, start_observation, episode, time
                 current.game_engine_subroutine == base.FLAGPOLE_SLIDE
             )
 
-            if _web_viewer is not None:
+            level_complete = any(
+                event.kind == GameEventType.LEVEL_COMPLETED for event in events
+            )
+            died = any(event.kind == GameEventType.DIED for event in events)
+            terminal_now = level_complete or died
+
+            if _web_viewer is not None and (
+                _commit_frame_index % _web_sample_stride == 0 or terminal_now
+            ):
                 _web_viewer.publish_core(
                     core,
                     current,
@@ -186,12 +222,10 @@ def _observed_commit_candidate(core, candidate, start_observation, episode, time
                     mode=_last_selection_mode,
                     action=v7.action_label(candidate.name),
                 )
-                if delay:
-                    time.sleep(delay)
 
-            if any(event.kind == GameEventType.LEVEL_COMPLETED for event in events):
+            if level_complete:
                 terminal = CandidateTerminal.LEVEL_COMPLETE
-            elif any(event.kind == GameEventType.DIED for event in events):
+            elif died:
                 terminal = CandidateTerminal.DEATH
             previous = current
             if terminal != CandidateTerminal.NONE:
@@ -207,7 +241,7 @@ def _consume_web_args() -> tuple[bool, int, float]:
     """Remove V8-only web flags before V7 argparse sees argv."""
     enabled = False
     port = 8765
-    fps = 30.0
+    fps = 15.0
     cleaned = [sys.argv[0]]
     i = 1
     while i < len(sys.argv):
@@ -238,14 +272,17 @@ def _consume_web_args() -> tuple[bool, int, float]:
             continue
         cleaned.append(arg)
         i += 1
+    if fps <= 0:
+        raise ValueError("--web-fps must be > 0")
     sys.argv[:] = cleaned
     return enabled, port, fps
 
 
 def main() -> int:
-    global _web_viewer, _web_fps
+    global _web_viewer, _web_fps, _web_sample_stride
 
     web_enabled, web_port, _web_fps = _consume_web_args()
+    _web_sample_stride = max(1, round(_NES_NOMINAL_FPS / _web_fps))
     v6.evaluate_candidates = evaluate_candidates
     v6.beam_search = beam_search
     v6.select_immediate = select_immediate
@@ -255,7 +292,12 @@ def main() -> int:
         _web_viewer.start()
         v7.commit_candidate = _observed_commit_candidate
         print(f"Web UI    : {_web_viewer.url}", flush=True)
-        print("Web scope : authoritative committed frames only; beam rollouts hidden", flush=True)
+        print(
+            "Web scope : authoritative commits only; beam rollouts hidden; "
+            f"sampling~{_NES_NOMINAL_FPS / _web_sample_stride:.1f} fps "
+            f"(every {_web_sample_stride} committed frames, no playback sleep)",
+            flush=True,
+        )
         try:
             webbrowser.open(_web_viewer.url, new=2)
         except Exception:
@@ -303,6 +345,13 @@ def _terminate_worker(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=2.0)
 
 
+def _print_timestamped(line: str) -> None:
+    if line.strip():
+        print(f"[{_timestamp()}] {line}", end="", flush=True)
+    else:
+        print(line, end="", flush=True)
+
+
 def _supervise() -> int:
     env = os.environ.copy()
     env[_WORKER_ENV] = "1"
@@ -329,7 +378,8 @@ def _supervise() -> int:
                 return proc.returncode or 0
             if time.monotonic() - last_output > _NO_OUTPUT_TIMEOUT_S:
                 print(
-                    f"V8 supervisor: FAIL no worker output for {_NO_OUTPUT_TIMEOUT_S:.0f}s; terminating stalled worker.",
+                    f"[{_timestamp()}] V8 supervisor: FAIL no worker output for "
+                    f"{_NO_OUTPUT_TIMEOUT_S:.0f}s; terminating stalled worker.",
                     flush=True,
                 )
                 _terminate_worker(proc)
@@ -340,7 +390,7 @@ def _supervise() -> int:
             return proc.wait()
 
         last_output = time.monotonic()
-        print(item, end="", flush=True)
+        _print_timestamped(item)
         code = _result_code(item.strip())
         if code is None:
             continue
@@ -349,7 +399,8 @@ def _supervise() -> int:
             proc.wait(timeout=_POST_RESULT_GRACE_S)
         except subprocess.TimeoutExpired:
             print(
-                "V8 supervisor: terminal planner result observed; terminating completed native worker.",
+                f"[{_timestamp()}] V8 supervisor: terminal planner result observed; "
+                "terminating completed native worker.",
                 flush=True,
             )
             _terminate_worker(proc)
