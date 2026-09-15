@@ -2,8 +2,10 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
 
+from fami_pixel.adapters.mesen import MesenLoadError
 
-def test_reward_beam_probe_imports():
+
+def _load_probe_module():
     path = Path(__file__).resolve().parents[1] / "tools" / "smb1_reward_beam_probe.py"
     module_name = "fami_pixel_reward_beam_probe_smoke"
     spec = spec_from_file_location(module_name, path)
@@ -23,6 +25,23 @@ def test_reward_beam_probe_imports():
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous
+    return module
 
+
+def test_reward_beam_probe_imports():
+    module = _load_probe_module()
     assert len(module.REWARD_BEAM_CHUNKS) >= 6
     assert module._DONE == "RewardBeamProbe: DONE"
+
+
+def test_reward_beam_probe_classifies_only_native_step_timeouts_as_recoverable():
+    module = _load_probe_module()
+    assert module._is_native_step_timeout(
+        MesenLoadError("FamiPixelStepFrame failed (4: timeout waiting for native frame advance).")
+    )
+    assert module._is_native_step_timeout(
+        MesenLoadError("FamiPixelStepFrame failed (5: timeout waiting for the new debugger stop).")
+    )
+    assert not module._is_native_step_timeout(
+        MesenLoadError("FamiPixelStepFrame failed (1: emulator is not running).")
+    )
