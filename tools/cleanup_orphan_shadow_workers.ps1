@@ -3,18 +3,17 @@ param(
     [switch]$AllPlannerProcesses
 )
 
-$pattern = 'mesen_smb_checkpoint_planner_v(11|12|13|14|15|16|17|18|19|20|21)\.py'
+$pattern = 'mesen_smb_checkpoint_planner_v(11|12|13|14|15|16|17|18|19|20|21|22)\.py'
+$shadowToken = '(?:^|\s)--shadow-worker(?:\s|$)'
+$authorityToken = '(?:^|\s)--authority-worker(?:\s|$)'
 
-$processes = Get-CimInstance Win32_Process |
+$processes = @(Get-CimInstance Win32_Process |
     Where-Object {
         $_.Name -match '^python(w)?\.exe$' -and
-        $_.CommandLine -match $pattern
+        $_.CommandLine -match $pattern -and
+        ($AllPlannerProcesses -or $_.CommandLine -match $shadowToken)
     } |
-    Sort-Object ProcessId
-
-if (-not $AllPlannerProcesses) {
-    $processes = $processes | Where-Object { $_.CommandLine -match '--shadow-worker' }
-}
+    Sort-Object ProcessId)
 
 if (-not $processes) {
     if ($AllPlannerProcesses) {
@@ -27,11 +26,11 @@ if (-not $processes) {
 }
 
 $rows = foreach ($process in $processes) {
-    $role = if ($process.CommandLine -match '--shadow-worker') {
-        'shadow'
-    }
-    elseif ($process.CommandLine -match '--authority-worker') {
+    $role = if ($process.CommandLine -match $authorityToken) {
         'authority'
+    }
+    elseif ($process.CommandLine -match $shadowToken) {
+        'shadow'
     }
     else {
         'supervisor'
@@ -51,7 +50,7 @@ $rows | Format-Table -AutoSize
 if (-not $Kill) {
     Write-Host ''
     if ($AllPlannerProcesses) {
-        Write-Host 'Dry run only. Stop any active fami-pixel planner, then re-run with -Kill -AllPlannerProcesses to remove all listed planner processes.'
+        Write-Host 'Dry run only. Stop any active fami-pixel planner, then re-run with -Kill -AllPlannerProcesses to remove these processes.'
     }
     else {
         Write-Host 'Dry run only. Stop any active fami-pixel planner, then re-run with -Kill to remove these workers.'
@@ -64,7 +63,14 @@ Write-Host "Stopping $($processes.Count) fami-pixel planner process(es)..."
 foreach ($process in $processes) {
     try {
         Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
-        Write-Host "stopped PID $($process.ProcessId)"
+        Start-Sleep -Milliseconds 100
+        $stillThere = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ProcessId)" -ErrorAction SilentlyContinue
+        if ($stillThere) {
+            Write-Warning "PID $($process.ProcessId) accepted Stop-Process but is still present; try taskkill /PID $($process.ProcessId) /T /F and inspect its role/parent."
+        }
+        else {
+            Write-Host "stopped PID $($process.ProcessId)"
+        }
     }
     catch {
         Write-Warning "failed to stop PID $($process.ProcessId): $($_.Exception.Message)"
