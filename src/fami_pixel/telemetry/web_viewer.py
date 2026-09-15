@@ -85,7 +85,7 @@ def raw_frame_to_png(frame) -> bytes:
 
     scanlines = bytearray()
     for y in range(height):
-        scanlines.append(0)  # PNG filter type: None
+        scanlines.append(0)
         row = y * width
         for x in range(width):
             r, g, b = _NES_RGB[int(frame.pixels[row + x]) & 0x3F]
@@ -108,10 +108,16 @@ def format_radar_strip(
     gap_dx: int | None,
     obstacle_dx: int | None,
     *,
+    reward_dx: int | None = None,
+    reward_marker: str = "R",
     lookahead_px: int = 192,
     width: int = 30,
 ) -> str:
-    """Render a compact forward-scene strip for human telemetry."""
+    """Render a compact forward-scene strip for human telemetry.
+
+    Hazard markers keep their established E/G/O semantics. The optional reward
+    marker is additive so older callers/tests remain valid.
+    """
     if lookahead_px <= 0 or width <= 0:
         raise ValueError("lookahead_px and width must be > 0")
     cells = ["-"] * width
@@ -124,6 +130,7 @@ def format_radar_strip(
         if dx < 0:
             return
         index = min(width - 1, max(0, round((dx / lookahead_px) * (width - 1))))
+        marker = str(marker or "R")[:1]
         if index in occupied:
             cells[index] = "*"
         else:
@@ -133,6 +140,7 @@ def format_radar_strip(
     place(enemy_dx, "E")
     place(gap_dx, "G")
     place(obstacle_dx, "O")
+    place(reward_dx, reward_marker)
     return "[M] " + "".join(cells)
 
 
@@ -165,6 +173,7 @@ h2 { margin: 0 0 10px; font-size: 14px; color: #d7d9df; letter-spacing: .04em; }
 .badge { display: inline-block; padding: 3px 7px; border-radius: 999px; border: 1px solid #3b3d43; background: #24262a; font-size: 11px; margin-top: 8px; }
 .badge.hazard { border-color: #8f554d; background: #35211f; color: #ffd3cc; }
 .badge.clear { border-color: #446d50; background: #1e3023; color: #ccebd3; }
+.badge.reward { border-color: #7d6c2b; background: #332d16; color: #ffe69a; }
 .small { font-size: 12px; color: #a5a8b0; line-height: 1.45; word-break: break-word; }
 @media (max-width: 1120px) { main { grid-template-columns: minmax(0, 640px) 320px; } }
 @media (max-width: 850px) { main { width: min(100% - 20px, 640px); grid-template-columns: 1fr; margin: 10px auto; } }
@@ -192,7 +201,7 @@ h2 { margin: 0 0 10px; font-size: 14px; color: #d7d9df; letter-spacing: .04em; }
     </div>
 
     <div class="section">
-      <h2>📡 RADAR</h2>
+      <h2>📡 HAZARD RADAR</h2>
       <div class="radar-grid">
         <div class="k">Enemy</div><div class="radar-value" id="radar_enemy_dx">--</div>
         <div class="k">Gap</div><div class="radar-value" id="radar_gap_dx">--</div>
@@ -201,6 +210,19 @@ h2 { margin: 0 0 10px; font-size: 14px; color: #d7d9df; letter-spacing: .04em; }
       <div id="radar-strip">[M] ------------------------------</div>
       <div id="hazard-badge" class="badge clear">scene clear</div>
       <div class="small" style="margin-top:8px">Reason: <span id="radar_reason">-</span></div>
+    </div>
+
+    <div class="section">
+      <h2>🎁 REWARD RADAR</h2>
+      <div class="radar-grid">
+        <div class="k">Target</div><div class="radar-value" id="radar_reward_type">--</div>
+        <div class="k">Distance</div><div class="radar-value" id="radar_reward_dx">--</div>
+        <div class="k">Utility</div><div class="radar-value" id="reward_utility">-</div>
+        <div class="k">Pursuit</div><div class="radar-value" id="pursuit_mode">-</div>
+        <div class="k">Player status</div><div class="radar-value" id="player_status">-</div>
+        <div class="k">Star timer</div><div class="radar-value" id="star_invincible_timer">-</div>
+      </div>
+      <div id="reward-badge" class="badge clear">no reward target</div>
     </div>
 
     <div class="section">
@@ -229,13 +251,15 @@ async function tick() {
     const s = await r.json();
     if (s.version !== version) {
       version = s.version;
-      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','plan_compute_ms','planner_state','buffered','guard_mode','radar_reason']) {
+      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','plan_compute_ms','planner_state','buffered','guard_mode','radar_reason','radar_reward_type','pursuit_mode','player_status','star_invincible_timer']) {
         const el = document.getElementById(k);
         if (el) el.textContent = s[k] ?? '-';
       }
       document.getElementById('radar_enemy_dx').textContent = distance(s.radar_enemy_dx);
       document.getElementById('radar_gap_dx').textContent = distance(s.radar_gap_dx);
       document.getElementById('radar_obstacle_dx').textContent = distance(s.radar_obstacle_dx);
+      document.getElementById('radar_reward_dx').textContent = distance(s.radar_reward_dx);
+      document.getElementById('reward_utility').textContent = score(s.reward_utility);
       document.getElementById('radar-strip').textContent = s.radar_strip || '[M] ------------------------------';
       document.getElementById('risk_probability').textContent = score(s.risk_probability);
       document.getElementById('no_progress_probability').textContent = score(s.no_progress_probability);
@@ -243,6 +267,10 @@ async function tick() {
       const hazard = !!s.hazard_ahead;
       badge.className = 'badge ' + (hazard ? 'hazard' : 'clear');
       badge.textContent = hazard ? 'hazard ahead' : 'scene clear';
+      const rewardBadge = document.getElementById('reward-badge');
+      const reward = s.radar_reward_type;
+      rewardBadge.className = 'badge ' + (reward ? 'reward' : 'clear');
+      rewardBadge.textContent = reward ? `target: ${reward}` : 'no reward target';
       if (s.has_frame) document.getElementById('frame').src = '/frame.bmp?v=' + version;
     }
   } catch (_) {}
@@ -293,6 +321,12 @@ class NesWebViewer:
             "radar_enemy_dx": None,
             "radar_gap_dx": None,
             "radar_obstacle_dx": None,
+            "radar_reward_dx": None,
+            "radar_reward_type": None,
+            "reward_utility": None,
+            "pursuit_mode": None,
+            "player_status": None,
+            "star_invincible_timer": None,
             "radar_reason": None,
             "radar_strip": format_radar_strip(None, None, None),
             "hazard_ahead": False,
@@ -387,6 +421,14 @@ class NesWebViewer:
         enemy_dx = metadata.get("radar_enemy_dx")
         gap_dx = metadata.get("radar_gap_dx")
         obstacle_dx = metadata.get("radar_obstacle_dx")
+        reward_dx = metadata.get("radar_reward_dx")
+        reward_type = metadata.get("radar_reward_type")
+        reward_marker = {
+            "star": "S",
+            "mushroom": "M",
+            "fire_flower": "F",
+            "one_up": "1",
+        }.get(str(reward_type), "R")
         state = {
             "version": 0,
             "has_frame": True,
@@ -409,8 +451,20 @@ class NesWebViewer:
             "radar_enemy_dx": enemy_dx,
             "radar_gap_dx": gap_dx,
             "radar_obstacle_dx": obstacle_dx,
+            "radar_reward_dx": reward_dx,
+            "radar_reward_type": reward_type,
+            "reward_utility": metadata.get("reward_utility"),
+            "pursuit_mode": metadata.get("pursuit_mode"),
+            "player_status": metadata.get("player_status"),
+            "star_invincible_timer": metadata.get("star_invincible_timer"),
             "radar_reason": metadata.get("radar_reason"),
-            "radar_strip": metadata.get("radar_strip") or format_radar_strip(enemy_dx, gap_dx, obstacle_dx),
+            "radar_strip": metadata.get("radar_strip") or format_radar_strip(
+                enemy_dx,
+                gap_dx,
+                obstacle_dx,
+                reward_dx=reward_dx,
+                reward_marker=reward_marker,
+            ),
             "hazard_ahead": bool(metadata.get("hazard_ahead", False)),
             "buffered": 0,
         }
