@@ -1,4 +1,6 @@
-$pattern = 'mesen_smb_checkpoint_planner_v(11|12|13|14|15|16|17|18|19|20|21)\.py'
+$pattern = 'mesen_smb_checkpoint_planner_v(11|12|13|14|15|16|17|18|19|20|21|22)\.py'
+$shadowToken = '(?:^|\s)--shadow-worker(?:\s|$)'
+$authorityToken = '(?:^|\s)--authority-worker(?:\s|$)'
 
 $processes = Get-CimInstance Win32_Process |
     Where-Object {
@@ -13,11 +15,11 @@ if (-not $processes) {
 }
 
 $rows = foreach ($process in $processes) {
-    $role = if ($process.CommandLine -match '--shadow-worker') {
-        'shadow'
-    }
-    elseif ($process.CommandLine -match '--authority-worker') {
+    $role = if ($process.CommandLine -match $authorityToken) {
         'authority'
+    }
+    elseif ($process.CommandLine -match $shadowToken) {
+        'shadow'
     }
     else {
         'supervisor'
