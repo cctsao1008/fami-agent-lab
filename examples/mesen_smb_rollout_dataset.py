@@ -2,15 +2,16 @@
 """Collect supervised SMB1 transition/risk samples from real Mesen rollouts.
 
 This is an offline teacher-data tool for issue #22. Mesen remains the only
-transition oracle.  Greedy mode follows one best trajectory; hazard mode expands
-a small breadth-first tree of surviving low-progress, boundary-like, and best
-children so hazard labels come from more distinct root states.
+transition oracle. Greedy mode follows one best trajectory; hazard mode expands
+a small breadth-first tree; hazard-beam keeps a fixed-width frontier so the
+teacher can reach deeper hazard boundaries without giving up local diversity.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import deque
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
@@ -19,7 +20,7 @@ import sys
 from fami_pixel.adapters.mesen import MesenCore, configure_standard_nes_controller
 from fami_pixel.games.smb1 import CandidateTerminal, observation_from_state, read_smb1_state
 from fami_pixel.learning import build_rollout_record, write_jsonl_record
-from fami_pixel.learning.hazard_sampling import select_hazard_branches
+from fami_pixel.learning.hazard_sampling import select_depth_beam, select_hazard_branches
 
 import mesen_smb_checkpoint_planner as base
 import mesen_smb_checkpoint_planner_v7 as v7
@@ -29,6 +30,23 @@ import mesen_smb_checkpoint_planner_v11 as v11
 
 _TERMINAL_PREFIX = "RolloutDataset:"
 _SUPERVISOR_GRACE_S = 0.75
+
+
+@dataclass(frozen=True)
+class _RootState:
+    checkpoint: Path
+    frame: int
+    x: int
+    engine: int
+
+
+@dataclass(frozen=True)
+class _BeamChild:
+    root: _RootState
+    outcome: object
+    observation: object
+    child_x: int
+    state_signature: tuple[int, int, int, int, int, int]
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,15 +66,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sampling",
-        choices=("greedy", "hazard"),
+        choices=("greedy", "hazard", "hazard-beam"),
         default="greedy",
-        help="greedy follows one best path; hazard expands diverse surviving child roots",
+        help=(
+            "greedy follows one best path; hazard expands a breadth-first tree; "
+            "hazard-beam prunes each depth to a fixed forward-moving beam"
+        ),
     )
     parser.add_argument(
         "--branch-width",
         type=int,
         default=3,
-        help="maximum children promoted per root in hazard mode",
+        help="maximum children/beam width for hazard sampling modes",
     )
     parser.add_argument(
         "--append",
@@ -110,7 +131,11 @@ def _state_signature(observation) -> tuple[int, int, int, int, int, int]:
 
 def _source_name(args: argparse.Namespace) -> str:
     base_name = f"offline-{args.candidate_set}"
-    return base_name if args.sampling == "greedy" else f"{base_name}-hazard"
+    if args.sampling == "greedy":
+        return base_name
+    if args.sampling == "hazard":
+        return f"{base_name}-hazard"
+    return f"{base_name}-hazard-beam"
 
 
 def _evaluate_root(
@@ -183,7 +208,7 @@ def _collect_greedy(core, args, candidates, checkpoint_dir: Path, output: Path, 
 
 
 def _collect_hazard(core, args, candidates, checkpoint_dir: Path, output: Path, source: str, current):
-    """Breadth-first expansion that deliberately seeks distinct hazard roots."""
+    """Breadth-first expansion that deliberately seeks distinct shallow hazard roots."""
     initial = checkpoint_dir / "hazard-root-0000.mss"
     root_frame, root_x, root_engine = base.save_checkpoint(core, initial)
     frontier = deque([(initial, root_frame, root_x, root_engine)])
@@ -239,6 +264,95 @@ def _collect_hazard(core, args, candidates, checkpoint_dir: Path, output: Path, 
     return records, current
 
 
+def _collect_hazard_beam(core, args, candidates, checkpoint_dir: Path, output: Path, source: str, current):
+    """Depth-oriented fixed-width beam for reaching deeper hazard boundaries."""
+    initial_path = checkpoint_dir / "hazard-beam-root-0000.mss"
+    root_frame, root_x, root_engine = base.save_checkpoint(core, initial_path)
+    beam = [_RootState(initial_path, root_frame, root_x, root_engine)]
+    seen_states = {_state_signature(current)}
+    records = 0
+    root_index = 0
+    depth = 0
+
+    while beam and root_index < args.roots:
+        expanded: list[_BeamChild] = []
+        print(f"beam depth {depth:03d} roots={len(beam)}", flush=True)
+
+        for beam_slot, root in enumerate(beam):
+            if root_index >= args.roots:
+                break
+
+            base.restore_checkpoint(core, root.checkpoint, root.frame, root.x, root.engine)
+            start = observation_from_state(core.frame_count(), read_smb1_state(core))
+            evaluated = _evaluate_root(
+                core,
+                candidates,
+                root.checkpoint,
+                root.frame,
+                root.x,
+                root.engine,
+                source=source,
+                generation=root_index,
+                output=output,
+                step_timeout=args.step_timeout,
+            )
+            records += len(evaluated)
+
+            death_count = sum(outcome.terminal == CandidateTerminal.DEATH for outcome in evaluated)
+            stalled_count = sum(int(outcome.progress) <= 0 for outcome in evaluated)
+            branches = select_hazard_branches(evaluated, args.branch_width)
+            print(
+                f"root {root_index:03d} depth={depth:03d} slot={beam_slot} "
+                f"frame={start.native_frame_id} X={start.mario_x_abs} "
+                f"death={death_count} no_progress={stalled_count} "
+                f"expand={[outcome.candidate.name for outcome in branches]}",
+                flush=True,
+            )
+
+            for branch_index, outcome in enumerate(branches):
+                base.restore_checkpoint(core, root.checkpoint, root.frame, root.x, root.engine)
+                commit_candidate(core, outcome.candidate, args.step_timeout)
+                child = observation_from_state(core.frame_count(), read_smb1_state(core))
+                signature = _state_signature(child)
+                if signature in seen_states:
+                    continue
+                seen_states.add(signature)
+
+                child_path = checkpoint_dir / (
+                    f"hazard-beam-d{depth:03d}-r{root_index:04d}-b{branch_index:02d}.mss"
+                )
+                child_frame, child_x, child_engine = base.save_checkpoint(core, child_path)
+                child_root = _RootState(child_path, child_frame, child_x, child_engine)
+                expanded.append(
+                    _BeamChild(
+                        root=child_root,
+                        outcome=outcome,
+                        observation=child,
+                        child_x=int(child.mario_x_abs),
+                        state_signature=signature,
+                    )
+                )
+
+            root_index += 1
+
+        selected = select_depth_beam(expanded, args.branch_width)
+        beam = [entry.root for entry in selected]
+        if selected:
+            current = max(selected, key=lambda entry: int(entry.child_x)).observation
+            print(
+                f"beam keep depth={depth + 1:03d} "
+                f"X={[int(entry.child_x) for entry in selected]} "
+                f"via={[entry.outcome.candidate.name for entry in selected]}",
+                flush=True,
+            )
+        else:
+            print("hazard-beam frontier exhausted", flush=True)
+
+        depth += 1
+
+    return records, current
+
+
 def _terminate_process_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
@@ -283,7 +397,7 @@ def collector_main(args: argparse.Namespace) -> int:
     print(f"Teacher roots : {args.roots}", flush=True)
     print(f"Candidates    : {len(candidates)} ({args.candidate_set})", flush=True)
     print(f"Sampling      : {args.sampling}", flush=True)
-    if args.sampling == "hazard":
+    if args.sampling in ("hazard", "hazard-beam"):
         print(f"Branch width  : {args.branch_width}", flush=True)
     print(f"Source        : {source}", flush=True)
     print(f"Dataset       : {output}", flush=True)
@@ -291,6 +405,10 @@ def collector_main(args: argparse.Namespace) -> int:
 
     if args.sampling == "hazard":
         records, current = _collect_hazard(
+            core, args, candidates, checkpoint_dir, output, source, current
+        )
+    elif args.sampling == "hazard-beam":
+        records, current = _collect_hazard_beam(
             core, args, candidates, checkpoint_dir, output, source, current
         )
     else:
