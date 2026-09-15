@@ -49,8 +49,27 @@ def _terminal_radar(core, current, fallback: dict) -> dict:
         return dict(fallback or {})
 
 
+def _create_recorder() -> LiveRunArtifacts | None:
+    try:
+        recorder = LiveRunArtifacts(root=Path("build/live-runs"), planner=PLANNER_NAME)
+        v11._log(f"Run evidence : {recorder.path}")
+        return recorder
+    except Exception as exc:
+        v11._log(f"Run evidence disabled: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _append_timeline(recorder: LiveRunArtifacts | None, payload: dict) -> None:
+    if recorder is None:
+        return
+    try:
+        recorder.append_timeline(payload)
+    except Exception as exc:
+        v11._log(f"Timeline write skipped: {type(exc).__name__}: {exc}")
+
+
 def _persist_terminal(
-    recorder: LiveRunArtifacts,
+    recorder: LiveRunArtifacts | None,
     *,
     terminal: str,
     core,
@@ -67,6 +86,8 @@ def _persist_terminal(
     last_stall,
 ) -> None:
     """Best-effort final evidence write; never mask the authoritative result."""
+    if recorder is None:
+        return
     try:
         radar = _terminal_radar(core, current, live_radar_payload)
         frame = copy_nes_raw_frame(core)
@@ -111,8 +132,7 @@ def authority_main(args) -> int:
     v13._DX_WEIGHT = float(args.surrogate_dx_weight)
     v12.reset_response_cache()
 
-    recorder = LiveRunArtifacts(root=Path("build/live-runs"), planner=PLANNER_NAME)
-    v11._log(f"Run evidence : {recorder.path}")
+    recorder = _create_recorder()
 
     checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -296,7 +316,8 @@ def authority_main(args) -> int:
                         f"risk={last_risk:.3f} guard={last_guard_mode}"
                     )
 
-                recorder.append_timeline(
+                _append_timeline(
+                    recorder,
                     {
                         "generation": generation,
                         "native_frame": int(current.native_frame_id),
@@ -311,7 +332,7 @@ def authority_main(args) -> int:
                         "no_progress_probability": last_stall,
                         "radar_reason": radar_reason,
                         "radar": live_radar_payload,
-                    }
+                    },
                 )
 
                 generation += 1
