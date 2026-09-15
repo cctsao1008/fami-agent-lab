@@ -1,12 +1,18 @@
 from pathlib import Path
 import importlib.util
+import sys
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "mesen_smb_checkpoint_planner_v11.py"
-spec = importlib.util.spec_from_file_location("planner_v11", MODULE_PATH)
-v11 = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(v11)
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+MODULE_PATH = EXAMPLES_DIR / "mesen_smb_checkpoint_planner_v11.py"
+sys.path.insert(0, str(EXAMPLES_DIR))
+try:
+    spec = importlib.util.spec_from_file_location("planner_v11", MODULE_PATH)
+    v11 = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(v11)
+finally:
+    sys.path.remove(str(EXAMPLES_DIR))
 
 
 def test_candidate_shards_cover_pool_without_overlap():
