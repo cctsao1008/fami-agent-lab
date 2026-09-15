@@ -2,10 +2,20 @@ from fami_pixel.learning.baseline_split import (
     candidate_mean_baseline,
     split_rollout_records,
     split_rollout_records_stratified,
+    summarize_partition,
 )
 
 
-def _row(source: str, generation: int, candidate: str, delta_x: int, *, death=False, no_progress=False):
+def _row(
+    source: str,
+    generation: int,
+    candidate: str,
+    delta_x: int,
+    *,
+    death=False,
+    doomed=False,
+    no_progress=False,
+):
     return {
         "schema": 1,
         "source": source,
@@ -15,6 +25,7 @@ def _row(source: str, generation: int, candidate: str, delta_x: int, *, death=Fa
         "target": {
             "delta_x": delta_x,
             "death": death,
+            "doomed_within_probe": doomed,
             "no_progress": no_progress,
         },
     }
@@ -69,6 +80,31 @@ def test_stratified_split_distributes_hazard_groups_without_row_leakage():
         assert any(row["target"]["no_progress"] for row in partition_rows)
 
 
+def test_stratified_split_treats_delayed_doomed_roots_as_risk():
+    rows = []
+    for generation in range(12):
+        hazard = generation % 3
+        for candidate in ("a", "b"):
+            rows.append(
+                _row(
+                    "offline-probe",
+                    generation,
+                    candidate,
+                    generation,
+                    doomed=(hazard == 0),
+                    no_progress=(hazard == 1),
+                )
+            )
+
+    split = split_rollout_records_stratified(rows)
+
+    for partition in ("train", "validation", "test"):
+        summary = summarize_partition(split[partition])
+        assert summary["risk_groups"] >= 1
+        assert summary["doomed_groups"] >= 1
+        assert summary["no_progress_groups"] >= 1
+
+
 def test_candidate_mean_baseline_reports_mae_and_grouped_ranking():
     train = [
         _row("offline-live", 0, "slow", 1),
@@ -88,3 +124,21 @@ def test_candidate_mean_baseline_reports_mae_and_grouped_ranking():
     assert result["ranking_groups"] == 2
     assert result["top1_ranking_accuracy"] == 1.0
     assert result["delta_x_mae"] >= 0.0
+
+
+def test_candidate_mean_baseline_accepts_actual_delta_x_ties():
+    train = [
+        _row("offline-live", 0, "a", 10),
+        _row("offline-live", 0, "b", 9),
+        _row("offline-live", 1, "a", 10),
+        _row("offline-live", 1, "b", 9),
+    ]
+    evaluate = [
+        _row("offline-live", 2, "a", 7),
+        _row("offline-live", 2, "b", 7),
+    ]
+
+    result = candidate_mean_baseline(train, evaluate)
+
+    assert result["ranking_groups"] == 1
+    assert result["top1_ranking_accuracy"] == 1.0
