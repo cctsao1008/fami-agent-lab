@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Evaluate bounded SMB1 trajectories from one local Mesen scenario root.
 
-This is a lab tool for issue #32, not yet the live V23 authority planner. It lets
-us test real Mesen futures from a deterministic local checkpoint before wiring
-the same evaluator into the asynchronous live search.
+This is a lab tool for issue #32, not yet the live authority planner. It lets us
+test real Mesen futures from a deterministic local checkpoint before wiring the
+same evaluator into the asynchronous live search.
 
 A hard horizon is *not* a safety result. It means the branch is unresolved: the
 simulator has not yet observed death, win, reward collection, capability change,
-or (for navigation objectives) a landing. The probe therefore marks an all-
-horizon comparison as provisional instead of presenting forward progress as a
-safe authoritative choice.
+or (for navigation objectives) a landing. Likewise, a set of resolved branches
+that are all DEATH is not a valid selection; the probe reports that no safe
+resolved branch exists instead of choosing the least-bad death.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from fami_pixel.games.smb1 import (
     read_smb1_state,
     trajectory_outcome_key,
 )
+from fami_pixel.games.smb1.forward_model import select_safe_resolved_result
 
 _DONE = "TrajectoryProbe: DONE"
 _GRACE_S = 0.75
@@ -204,15 +205,14 @@ def worker(args: argparse.Namespace) -> int:
             )
 
         best = max(results, key=trajectory_outcome_key)
-        resolved = [result for result in results if result.event != TrajectoryEvent.HORIZON]
-        if resolved:
-            best_resolved = max(resolved, key=trajectory_outcome_key)
+        best_safe = select_safe_resolved_result(results)
+        if best_safe is not None:
             print(
-                f"SELECT     : {best_resolved.plan.name} -> {best_resolved.event.value} "
-                f"key={trajectory_outcome_key(best_resolved)}",
+                f"SELECT     : {best_safe.plan.name} -> {best_safe.event.value} "
+                f"key={trajectory_outcome_key(best_safe)}",
                 flush=True,
             )
-        else:
+        elif all(result.event == TrajectoryEvent.HORIZON for result in results):
             print(
                 f"PROVISIONAL: {best.plan.name} -> horizon key={trajectory_outcome_key(best)}",
                 flush=True,
@@ -222,11 +222,23 @@ def worker(args: argparse.Namespace) -> int:
                 "authoritative safety/landing evidence. Increase --max-horizon.",
                 flush=True,
             )
+        else:
+            resolved_events = sorted(
+                {result.event.value for result in results if result.event != TrajectoryEvent.HORIZON}
+            )
+            print(
+                "NO SAFE    : no Mesen-resolved non-death trajectory exists in this probe "
+                f"vocabulary; resolved-events={','.join(resolved_events) or 'none'}",
+                flush=True,
+            )
+            print(
+                f"DIAGNOSTIC : highest-ranked observed branch is {best.plan.name} -> "
+                f"{best.event.value} key={trajectory_outcome_key(best)} (not selected)",
+                flush=True,
+            )
         print(_DONE, flush=True)
         return 0
     finally:
-        # Normal teardown is best-effort. The supervisor below owns the final
-        # containment boundary if native Mesen teardown stalls.
         try:
             core.stop()
             core.release()
@@ -249,8 +261,6 @@ def _terminate_tree(proc: subprocess.Popen) -> None:
 
 
 def supervise(args: argparse.Namespace) -> int:
-    # Validate the local scenario before spawning the worker, so extraction
-    # failures produce one concise message instead of a child traceback.
     _load_manifest(args.scenario_dir.expanduser().resolve())
 
     cmd = [sys.executable, "-u", str(Path(__file__).resolve()), *sys.argv[1:], "--worker"]
