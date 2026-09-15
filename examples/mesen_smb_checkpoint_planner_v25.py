@@ -52,9 +52,7 @@ from fami_pixel.games.smb1.reward_target import read_active_reward_target
 
 import mesen_smb_checkpoint_planner as base
 import mesen_smb_checkpoint_planner_v11 as v11
-import mesen_smb_checkpoint_planner_v14 as v14
 import mesen_smb_checkpoint_planner_v15 as v15
-import mesen_smb_checkpoint_planner_v17 as v17
 import mesen_smb_checkpoint_planner_v20 as v20
 import mesen_smb_checkpoint_planner_v23 as v23
 import mesen_smb_checkpoint_planner_v24 as v24
@@ -465,7 +463,6 @@ def _install_v25_overrides() -> None:
     v23._forward_schedule_label = _v25_schedule_label
     v23.authority_main = authority_main
     v23.__file__ = __file__
-    v14._schedule_label = _v25_schedule_label
     v15._JUMP_NAMES.update(_REWARD_JUMP_NAMES)
 
 
