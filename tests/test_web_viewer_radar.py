@@ -15,6 +15,21 @@ def test_radar_strip_places_forward_hazards():
     assert strip.index("E") < strip.index("O") < strip.index("G")
 
 
+def test_radar_strip_places_reward_marker():
+    strip = format_radar_strip(
+        None,
+        None,
+        None,
+        reward_dx=48,
+        reward_marker="S",
+        lookahead_px=192,
+        width=24,
+    )
+
+    assert strip.startswith("[M] ")
+    assert "S" in strip
+
+
 def test_radar_strip_ignores_missing_and_behind_objects():
     strip = format_radar_strip(-8, None, None, lookahead_px=192, width=12)
 
