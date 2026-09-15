@@ -102,6 +102,26 @@ def reward_collection_proven(
     return False
 
 
+def reward_object_is_active(reward: dict | None) -> bool:
+    """Return whether the native PowerUpObject has entered its active phase.
+
+    The deterministic V24 Star replay exposed a useful state transition:
+    ``Enemy_State`` advances through small emergence-counter values (2..17)
+    while the item rises from the block, then switches to ``0x80`` when the
+    active object phase begins.  Treating every state >= 3 as active incorrectly
+    rewarded still-emerging states.  Bit 7 is therefore used only as a ranking
+    hint here; collection remains proven exclusively by capability state.
+    """
+
+    if reward is None:
+        return False
+    try:
+        state = int(reward.get("state", 0)) & 0xFF
+    except (TypeError, ValueError):
+        return False
+    return bool(state & 0x80)
+
+
 def reward_beam_key(
     *,
     reward: dict | None,
@@ -113,7 +133,7 @@ def reward_beam_key(
     Ordering is deliberately lexicographic:
 
     1. keep the target visible,
-    2. prefer an active/spawned target state,
+    2. prefer a natively active/released target over one still emerging,
     3. reduce absolute interception distance,
     4. retain clearance from an enemy immediately ahead,
     5. use Mario X only as a final deterministic tie-breaker.
@@ -126,15 +146,7 @@ def reward_beam_key(
         return (0, 0, -1_000_000, -1_000_000, -int(mario_x))
 
     dx = int(reward.get("dx", 0))
-    try:
-        state = int(reward.get("state", 0))
-    except (TypeError, ValueError):
-        state = 0
-
-    # SMB1's active PowerUpObject is observed as state 3 in the current field
-    # evidence. Do not make state >=3 a collection claim; it is only a ranking
-    # hint that waiting near an emerging item can be useful.
-    active = 1 if state >= 3 else 0
+    active = 1 if reward_object_is_active(reward) else 0
 
     if nearest_enemy_dx is None:
         clearance = 255
