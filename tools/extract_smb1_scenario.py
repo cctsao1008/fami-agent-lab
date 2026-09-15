@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Extract one local deterministic SMB1 scenario from a live-run checkpoint set.
 
-The live planner already saves one Mesen state per generation under its isolated
-runtime directory. This tool maps a timeline record back to that checkpoint and
-copies it into ``build/scenarios/<id>/`` together with a small JSON manifest.
+The live planner saves one Mesen state per generation under its isolated runtime
+directory. V11 keeps only a short rolling window, while current V22 supervisors
+also preserve stable historical states under ``<runtime>/archive/`` for issue
+#32 trajectory regression.
 
+This tool maps a timeline record back to an exact or nearest-earlier preserved
+checkpoint and copies it into ``build/scenarios/<id>/`` with a JSON manifest.
 The resulting .mss file remains local because ``build/`` is gitignored.
 """
 
@@ -14,6 +17,11 @@ import argparse
 import json
 from pathlib import Path
 import shutil
+
+from fami_pixel.runtime.checkpoint_archive import (
+    available_checkpoint_generations,
+    resolve_checkpoint,
+)
 
 
 def _load_timeline(path: Path) -> list[dict]:
@@ -85,6 +93,23 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _missing_checkpoint_message(checkpoint_dir: Path, desired_generation: int) -> str:
+    available = available_checkpoint_generations(checkpoint_dir)
+    if not available:
+        available_text = "none"
+    else:
+        available_text = f"{available[0]}..{available[-1]} ({len(available)} states)"
+    return (
+        f"no preserved checkpoint at or before generation {desired_generation}\n"
+        f"Runtime IPC: {checkpoint_dir}\n"
+        f"Available  : {available_text}\n\n"
+        "This run predates the V22 checkpoint archive or the requested historical "
+        "root was already pruned by V11's rolling window. That state cannot be "
+        "reconstructed from the timeline alone. Run current V22 once more; it now "
+        "prints 'Checkpoint archive:' and preserves live roots under <runtime>/archive/."
+    )
+
+
 def main() -> int:
     args = parse_args()
     timeline = args.timeline.expanduser().resolve()
@@ -93,17 +118,16 @@ def main() -> int:
     selected = _select_record(args, records)
 
     selected_generation = int(selected.get("generation", -1))
-    root_generation = max(0, selected_generation - max(0, args.lead_generations))
-    root_record = _record_for_generation(records, root_generation)
-    root_generation = int(root_record.get("generation", root_generation))
+    desired_generation = max(0, selected_generation - max(0, args.lead_generations))
+    desired_record = _record_for_generation(records, desired_generation)
+    desired_generation = int(desired_record.get("generation", desired_generation))
 
-    source_state = checkpoint_dir / f"live-{root_generation:06d}.mss"
-    if not source_state.is_file():
-        raise SystemExit(
-            "matching checkpoint not found: "
-            f"{source_state}\n"
-            "Make sure checkpoint_dir is the Runtime IPC directory from the same live run."
-        )
+    source_state, actual_generation = resolve_checkpoint(checkpoint_dir, desired_generation)
+    if source_state is None or actual_generation is None:
+        raise SystemExit(_missing_checkpoint_message(checkpoint_dir, desired_generation))
+
+    root_record = _record_for_generation(records, actual_generation)
+    root_generation = int(root_record.get("generation", actual_generation))
 
     scenario_dir = args.output_root.expanduser().resolve() / args.scenario_id
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +139,7 @@ def main() -> int:
         "id": args.scenario_id,
         "state_file": "root.mss",
         "root_generation": root_generation,
+        "requested_root_generation": desired_generation,
         "native_frame": root_record.get("native_frame"),
         "mario_x": root_record.get("mario_x"),
         "mario_y": root_record.get("mario_y"),
@@ -125,13 +150,23 @@ def main() -> int:
         "selection_reward_dx": selected.get("reward_target_dx"),
         "source_timeline": str(timeline),
         "source_checkpoint_dir": str(checkpoint_dir),
+        "source_checkpoint": str(source_state),
     }
     manifest_path = scenario_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
     print(f"Scenario   : {args.scenario_id}")
-    print(f"Generation : {root_generation} (selected {selected_generation}, lead {args.lead_generations})")
+    if root_generation != desired_generation:
+        print(
+            f"Checkpoint : fallback generation {root_generation} "
+            f"(requested {desired_generation})"
+        )
+    print(
+        f"Generation : {root_generation} "
+        f"(selected {selected_generation}, lead {args.lead_generations})"
+    )
     print(f"Mario      : X={manifest['mario_x']} frame={manifest['native_frame']}")
+    print(f"Source     : {source_state}")
     print(f"State      : {dest_state}")
     print(f"Manifest   : {manifest_path}")
     return 0
