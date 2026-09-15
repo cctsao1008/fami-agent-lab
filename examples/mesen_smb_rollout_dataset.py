@@ -10,7 +10,10 @@ SMB1 observation. The learned model is not used here.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 from fami_pixel.adapters.mesen import MesenCore, configure_standard_nes_controller
 from fami_pixel.games.smb1 import CandidateTerminal, observation_from_state, read_smb1_state
@@ -20,6 +23,10 @@ import mesen_smb_checkpoint_planner as base
 import mesen_smb_checkpoint_planner_v7 as v7
 import mesen_smb_checkpoint_planner_v10 as v10
 import mesen_smb_checkpoint_planner_v11 as v11
+
+
+_TERMINAL_PREFIX = "RolloutDataset:"
+_SUPERVISOR_GRACE_S = 0.75
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +44,12 @@ def parse_args() -> argparse.Namespace:
         default="live",
         help="candidate family evaluated from each root checkpoint",
     )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="append to an existing dataset instead of replacing it for this collection run",
+    )
+    parser.add_argument("--collector-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.roots <= 0:
         parser.error("--roots must be > 0")
@@ -68,13 +81,35 @@ def commit_candidate(core, candidate, step_timeout: float) -> None:
     base.set_nes_controller_state(core, 0, 0x00)
 
 
-def main() -> int:
-    args = parse_args()
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def collector_main(args: argparse.Namespace) -> int:
     candidates = candidate_pool(args.candidate_set)
     checkpoint_dir = args.checkpoint_dir.expanduser().resolve()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     output = args.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    if not args.append:
+        try:
+            output.unlink()
+        except FileNotFoundError:
+            pass
 
     core = MesenCore(args.dll)
     core.initialize_headless(args.home)
@@ -87,9 +122,10 @@ def main() -> int:
     current = observation_from_state(core.frame_count(), state)
     records = 0
 
-    print(f"Teacher roots : {args.roots}")
-    print(f"Candidates    : {len(candidates)} ({args.candidate_set})")
-    print(f"Dataset       : {output}")
+    print(f"Teacher roots : {args.roots}", flush=True)
+    print(f"Candidates    : {len(candidates)} ({args.candidate_set})", flush=True)
+    print(f"Dataset       : {output}", flush=True)
+    print(f"Output mode   : {'append' if args.append else 'replace'}", flush=True)
 
     for root_index in range(args.roots):
         checkpoint = checkpoint_dir / f"root-{root_index:04d}.mss"
@@ -116,21 +152,61 @@ def main() -> int:
         best = max(evaluated, key=outcome_score)
         print(
             f"root {root_index:03d} frame={start.native_frame_id} X={start.mario_x_abs} "
-            f"-> {best.candidate.name} progress={best.progress:+d} terminal={best.terminal.value}"
+            f"-> {best.candidate.name} progress={best.progress:+d} terminal={best.terminal.value}",
+            flush=True,
         )
 
         if best.terminal != CandidateTerminal.NONE:
-            print(f"teacher stopped on terminal={best.terminal.value}")
+            print(f"teacher stopped on terminal={best.terminal.value}", flush=True)
             break
 
         base.restore_checkpoint(core, checkpoint, root_frame, root_x, root_engine)
         commit_candidate(core, best.candidate, args.step_timeout)
         current = observation_from_state(core.frame_count(), read_smb1_state(core))
 
-    print(f"records       : {records}")
-    print(f"final frame   : {current.native_frame_id}")
-    print(f"final X       : {current.mario_x_abs}")
+    print(f"records       : {records}", flush=True)
+    print(f"final frame   : {current.native_frame_id}", flush=True)
+    print(f"final X       : {current.mario_x_abs}", flush=True)
+    print(f"RolloutDataset: COMPLETE records={records} output={output}", flush=True)
     return 0
+
+
+def supervise_main() -> int:
+    cmd = [
+        sys.executable,
+        "-u",
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+        "--collector-worker",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    for line in iter(proc.stdout.readline, ""):
+        print(line, end="", flush=True)
+        if _TERMINAL_PREFIX not in line:
+            continue
+        try:
+            return proc.wait(timeout=_SUPERVISOR_GRACE_S)
+        except subprocess.TimeoutExpired:
+            print("RolloutDataset supervisor: collection complete; terminating native process tree", flush=True)
+            _terminate_process_tree(proc)
+            return 0
+
+    return proc.wait()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.collector_worker:
+        return collector_main(args)
+    return supervise_main()
 
 
 if __name__ == "__main__":
