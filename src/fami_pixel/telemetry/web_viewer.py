@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from array import array
 from collections import deque
+import binascii
 import json
 import struct
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fami_pixel.adapters.mesen import copy_nes_raw_frame
@@ -67,6 +69,73 @@ def raw_frame_to_bmp(frame) -> bytes:
     return _packed_frame_to_bmp(frame.width, frame.height, packed)
 
 
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    body = kind + payload
+    return struct.pack(">I", len(payload)) + body + struct.pack(">I", binascii.crc32(body) & 0xFFFFFFFF)
+
+
+def raw_frame_to_png(frame) -> bytes:
+    """Encode a caller-owned NES raw frame as dependency-free RGB PNG."""
+    width = int(frame.width)
+    height = int(frame.height)
+    if width <= 0 or height <= 0:
+        raise ValueError("frame geometry must be positive")
+    if len(frame.pixels) != width * height:
+        raise ValueError("frame pixel count does not match geometry")
+
+    scanlines = bytearray()
+    for y in range(height):
+        scanlines.append(0)  # PNG filter type: None
+        row = y * width
+        for x in range(width):
+            r, g, b = _NES_RGB[int(frame.pixels[row + x]) & 0x3F]
+            scanlines.extend((r, g, b))
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"".join(
+        (
+            signature,
+            _png_chunk(b"IHDR", ihdr),
+            _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), level=6)),
+            _png_chunk(b"IEND", b""),
+        )
+    )
+
+
+def format_radar_strip(
+    enemy_dx: int | None,
+    gap_dx: int | None,
+    obstacle_dx: int | None,
+    *,
+    lookahead_px: int = 192,
+    width: int = 30,
+) -> str:
+    """Render a compact forward-scene strip for human telemetry."""
+    if lookahead_px <= 0 or width <= 0:
+        raise ValueError("lookahead_px and width must be > 0")
+    cells = ["-"] * width
+    occupied: set[int] = set()
+
+    def place(distance, marker):
+        if distance is None:
+            return
+        dx = int(distance)
+        if dx < 0:
+            return
+        index = min(width - 1, max(0, round((dx / lookahead_px) * (width - 1))))
+        if index in occupied:
+            cells[index] = "*"
+        else:
+            cells[index] = marker
+            occupied.add(index)
+
+    place(enemy_dx, "E")
+    place(gap_dx, "G")
+    place(obstacle_dx, "O")
+    return "[M] " + "".join(cells)
+
+
 _HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -76,19 +145,28 @@ _HTML = r"""<!doctype html>
 <style>
 :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 * { box-sizing: border-box; }
-body { margin: 0; background: #111; color: #eee; }
-main { width: min(100% - 32px, 1160px); margin: 24px auto; display: grid; grid-template-columns: minmax(0, 768px) 320px; align-items: start; justify-content: center; gap: 18px; }
-.card { background: #1b1b1b; border: 1px solid #333; border-radius: 12px; padding: 14px; }
+body { margin: 0; background: #101113; color: #eee; }
+main { width: min(100% - 32px, 1220px); margin: 24px auto; display: grid; grid-template-columns: minmax(0, 768px) 350px; align-items: start; justify-content: center; gap: 18px; }
+.card { background: #1b1c1f; border: 1px solid #34363b; border-radius: 12px; padding: 14px; }
 .game-card { width: 100%; }
 #frame-wrap { width: min(100%, 768px); aspect-ratio: 256 / 240; margin: 0 auto; background: #000; overflow: hidden; }
 #frame { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; display: block; }
 h1 { margin: 0 0 12px; font-size: 18px; }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
-.k { color: #999; }
-.v { text-align: right; }
-#action { font-size: 18px; margin: 8px 0 14px; }
-#status { margin-top: 12px; color: #aaa; font-size: 12px; }
-@media (max-width: 1120px) { main { grid-template-columns: minmax(0, 640px) 300px; } }
+h2 { margin: 0 0 10px; font-size: 14px; color: #d7d9df; letter-spacing: .04em; }
+.section { border-top: 1px solid #34363b; margin-top: 14px; padding-top: 14px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 12px; }
+.k { color: #9b9ea6; }
+.v { text-align: right; color: #f4f4f5; }
+#action { font-size: 18px; margin: 8px 0 12px; min-height: 22px; }
+#status { margin-top: 12px; color: #8d9098; font-size: 12px; line-height: 1.4; }
+.radar-grid { display: grid; grid-template-columns: 1fr auto; gap: 8px 14px; }
+.radar-value { text-align: right; font-weight: 700; }
+#radar-strip { margin-top: 12px; padding: 10px; border-radius: 8px; background: #101113; border: 1px solid #303238; white-space: pre; overflow-x: auto; color: #dfe3ea; }
+.badge { display: inline-block; padding: 3px 7px; border-radius: 999px; border: 1px solid #3b3d43; background: #24262a; font-size: 11px; margin-top: 8px; }
+.badge.hazard { border-color: #8f554d; background: #35211f; color: #ffd3cc; }
+.badge.clear { border-color: #446d50; background: #1e3023; color: #ccebd3; }
+.small { font-size: 12px; color: #a5a8b0; line-height: 1.45; word-break: break-word; }
+@media (max-width: 1120px) { main { grid-template-columns: minmax(0, 640px) 320px; } }
 @media (max-width: 850px) { main { width: min(100% - 20px, 640px); grid-template-columns: 1fr; margin: 10px auto; } }
 </style>
 </head>
@@ -99,6 +177,7 @@ h1 { margin: 0 0 12px; font-size: 18px; }
     <div id="frame-wrap"><img id="frame" alt="NES authoritative framebuffer"></div>
   </section>
   <aside class="card">
+    <h2>CONTROL</h2>
     <div class="k">Applied action</div>
     <div id="action">waiting...</div>
     <div class="grid">
@@ -110,27 +189,60 @@ h1 { margin: 0 0 12px; font-size: 18px; }
       <div class="k">VX</div><div class="v" id="vx">-</div>
       <div class="k">VY</div><div class="v" id="vy">-</div>
       <div class="k">Engine</div><div class="v" id="engine">-</div>
-      <div class="k">Plan root frame</div><div class="v" id="plan_root_frame">-</div>
-      <div class="k">Plan age</div><div class="v" id="plan_age">-</div>
-      <div class="k">Plan compute</div><div class="v" id="plan_compute_ms">-</div>
-      <div class="k">Planner state</div><div class="v" id="planner_state">-</div>
-      <div class="k">Playback buffer</div><div class="v" id="buffered">-</div>
+    </div>
+
+    <div class="section">
+      <h2>📡 RADAR</h2>
+      <div class="radar-grid">
+        <div class="k">Enemy</div><div class="radar-value" id="radar_enemy_dx">--</div>
+        <div class="k">Gap</div><div class="radar-value" id="radar_gap_dx">--</div>
+        <div class="k">Obstacle</div><div class="radar-value" id="radar_obstacle_dx">--</div>
+      </div>
+      <div id="radar-strip">[M] ------------------------------</div>
+      <div id="hazard-badge" class="badge clear">scene clear</div>
+      <div class="small" style="margin-top:8px">Reason: <span id="radar_reason">-</span></div>
+    </div>
+
+    <div class="section">
+      <h2>PLANNER / SURROGATE</h2>
+      <div class="grid">
+        <div class="k">Guard mode</div><div class="v" id="guard_mode">-</div>
+        <div class="k">Risk</div><div class="v" id="risk_probability">-</div>
+        <div class="k">No-progress</div><div class="v" id="no_progress_probability">-</div>
+        <div class="k">Plan root frame</div><div class="v" id="plan_root_frame">-</div>
+        <div class="k">Plan age</div><div class="v" id="plan_age">-</div>
+        <div class="k">Plan compute</div><div class="v" id="plan_compute_ms">-</div>
+        <div class="k">Planner state</div><div class="v" id="planner_state">-</div>
+        <div class="k">Playback buffer</div><div class="v" id="buffered">-</div>
+      </div>
     </div>
     <div id="status">authoritative playback; counterfactual rollouts are hidden</div>
   </aside>
 </main>
 <script>
 let version = -1;
+function distance(v) { return (v === null || v === undefined) ? '--' : `${v} px →`; }
+function score(v) { return (v === null || v === undefined) ? '-' : Number(v).toFixed(3); }
 async function tick() {
   try {
     const r = await fetch('/state.json', {cache:'no-store'});
     const s = await r.json();
     if (s.version !== version) {
       version = s.version;
-      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','plan_compute_ms','planner_state','buffered']) {
+      for (const k of ['decision','mode','action','native_frame','x','y','vx','vy','engine','plan_root_frame','plan_age','plan_compute_ms','planner_state','buffered','guard_mode','radar_reason']) {
         const el = document.getElementById(k);
         if (el) el.textContent = s[k] ?? '-';
       }
+      document.getElementById('radar_enemy_dx').textContent = distance(s.radar_enemy_dx);
+      document.getElementById('radar_gap_dx').textContent = distance(s.radar_gap_dx);
+      document.getElementById('radar_obstacle_dx').textContent = distance(s.radar_obstacle_dx);
+      document.getElementById('radar-strip').textContent = s.radar_strip || '[M] ------------------------------';
+      document.getElementById('risk_probability').textContent = score(s.risk_probability);
+      document.getElementById('no_progress_probability').textContent = score(s.no_progress_probability);
+      const badge = document.getElementById('hazard-badge');
+      const hazard = !!s.hazard_ahead;
+      badge.className = 'badge ' + (hazard ? 'hazard' : 'clear');
+      badge.textContent = hazard ? 'hazard ahead' : 'scene clear';
       if (s.has_frame) document.getElementById('frame').src = '/frame.bmp?v=' + version;
     }
   } catch (_) {}
@@ -175,6 +287,15 @@ class NesWebViewer:
             "plan_age": None,
             "plan_compute_ms": None,
             "planner_state": None,
+            "guard_mode": None,
+            "risk_probability": None,
+            "no_progress_probability": None,
+            "radar_enemy_dx": None,
+            "radar_gap_dx": None,
+            "radar_obstacle_dx": None,
+            "radar_reason": None,
+            "radar_strip": format_radar_strip(None, None, None),
+            "hazard_ahead": False,
             "buffered": 0,
         }
         self._server: ThreadingHTTPServer | None = None
@@ -263,6 +384,9 @@ class NesWebViewer:
         vx = vx - 256 if vx >= 128 else vx
         vy = vy - 256 if vy >= 128 else vy
         metadata = metadata or {}
+        enemy_dx = metadata.get("radar_enemy_dx")
+        gap_dx = metadata.get("radar_gap_dx")
+        obstacle_dx = metadata.get("radar_obstacle_dx")
         state = {
             "version": 0,
             "has_frame": True,
@@ -279,6 +403,15 @@ class NesWebViewer:
             "plan_age": metadata.get("plan_age"),
             "plan_compute_ms": metadata.get("plan_compute_ms"),
             "planner_state": metadata.get("planner_state"),
+            "guard_mode": metadata.get("guard_mode"),
+            "risk_probability": metadata.get("risk_probability"),
+            "no_progress_probability": metadata.get("no_progress_probability"),
+            "radar_enemy_dx": enemy_dx,
+            "radar_gap_dx": gap_dx,
+            "radar_obstacle_dx": obstacle_dx,
+            "radar_reason": metadata.get("radar_reason"),
+            "radar_strip": metadata.get("radar_strip") or format_radar_strip(enemy_dx, gap_dx, obstacle_dx),
+            "hazard_ahead": bool(metadata.get("hazard_ahead", False)),
             "buffered": 0,
         }
         with self._condition:
