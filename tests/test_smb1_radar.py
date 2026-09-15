@@ -6,10 +6,15 @@ from fami_pixel.games.smb1.radar import (
     ADDR_ENEMY_X,
     ADDR_ENEMY_Y,
     ADDR_ENEMY_Y_HIGH,
+    ADDR_PLAYER_STATUS,
+    ADDR_POWER_UP_TYPE,
     ADDR_SCREEN_RIGHT_PAGE,
     ADDR_SCREEN_RIGHT_X,
+    ADDR_STAR_INVINCIBLE_TIMER,
     BLOCK_BUFFER_1,
     BLOCK_BUFFER_2,
+    POWER_UP_OBJECT_ID,
+    POWER_UP_SLOT,
     decode_smb1_radar,
 )
 
@@ -76,3 +81,49 @@ def test_radar_ignores_defeated_enemy_slots():
 
     assert radar.nearest_enemy_dx is None
     assert radar.enemies == ()
+
+
+def test_power_up_object_is_reward_not_enemy_hazard():
+    ram = bytearray(0x800)
+    player_x = 0x0600
+    ram[ADDR_SCREEN_RIGHT_PAGE] = 0x06
+    ram[ADDR_SCREEN_RIGHT_X] = 0xD0
+    ram[ADDR_POWER_UP_TYPE] = 2  # Star
+    ram[ADDR_PLAYER_STATUS] = 0
+    ram[ADDR_STAR_INVINCIBLE_TIMER] = 0
+
+    slot = POWER_UP_SLOT
+    ram[ADDR_ENEMY_FLAG + slot] = 1
+    ram[ADDR_ENEMY_ID + slot] = POWER_UP_OBJECT_ID
+    ram[ADDR_ENEMY_STATE + slot] = 0x80
+    ram[ADDR_ENEMY_PAGE + slot] = 0x06
+    ram[ADDR_ENEMY_X + slot] = 0x40
+    ram[ADDR_ENEMY_Y_HIGH + slot] = 1
+    ram[ADDR_ENEMY_Y + slot] = 144
+
+    radar = decode_smb1_radar(bytes(ram), player_x=player_x, lookahead_px=192)
+    payload = radar.to_payload()
+
+    assert radar.enemies == ()
+    assert radar.nearest_enemy_dx is None
+    assert radar.nearest_reward_dx == 64
+    assert radar.nearest_reward_type == "star"
+    assert radar.rewards[0].slot == POWER_UP_SLOT
+    assert radar.rewards[0].power_up_type == 2
+    assert payload["rewards"][0]["type"] == "star"
+
+
+def test_radar_exposes_player_capability_state():
+    ram = bytearray(0x800)
+    player_x = 100
+    ram[ADDR_SCREEN_RIGHT_PAGE] = 0
+    ram[ADDR_SCREEN_RIGHT_X] = 220
+    ram[ADDR_PLAYER_STATUS] = 2
+    ram[ADDR_STAR_INVINCIBLE_TIMER] = 0x23
+
+    radar = decode_smb1_radar(bytes(ram), player_x=player_x, lookahead_px=64)
+
+    assert radar.player_status == 2
+    assert radar.star_invincible_timer == 0x23
+    assert radar.invincible is True
+    assert radar.to_payload()["invincible"] is True
