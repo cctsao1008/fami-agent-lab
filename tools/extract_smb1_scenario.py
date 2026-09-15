@@ -9,6 +9,10 @@ rolling planner prunes them.
 This tool maps a timeline event back to that exact preserved Mesen state and
 copies it into ``build/scenarios/<id>/`` with a JSON manifest. Pass ``auto`` as
 the checkpoint directory to discover the matching recent ``run-*`` directory.
+For failure scenarios, ``--stable-root`` can rewind farther than the nominal lead
+until the latest known grounded/control-stable timeline record is found, avoiding
+checkpoints that are already inside an unrecoverable fall.
+
 The resulting .mss file remains local because ``build/`` is gitignored.
 """
 
@@ -72,6 +76,45 @@ def _record_for_generation(records: list[dict], generation: int) -> dict:
     if not older:
         raise SystemExit(f"no timeline record at or before generation {generation}")
     return max(older, key=lambda r: int(r.get("generation", -1)))
+
+
+def _record_grounded(record: dict) -> bool:
+    """Return grounded evidence from V20+ radar telemetry when available.
+
+    The explicit ``radar.grounded`` bit is preferred. A conservative fallback is
+    provided for older evidence that still contains the native Y-high / VY fields.
+    We intentionally do not infer safety merely from Mario X or from a low risk
+    score; the goal is only to avoid extracting roots that are already falling.
+    """
+
+    radar = record.get("radar") or {}
+    grounded = radar.get("grounded")
+    if grounded is not None:
+        return bool(grounded)
+
+    try:
+        y = int(record.get("mario_y"))
+        y_high = int(radar.get("player_y_high"))
+        vy = int(radar.get("player_vy"))
+    except (TypeError, ValueError):
+        return False
+    return y_high == 1 and 160 <= y <= 192 and vy == 0
+
+
+def _stable_record_at_or_before(records: list[dict], generation: int) -> dict:
+    """Return the newest grounded/control-stable record at or before generation."""
+
+    candidates = [
+        record
+        for record in records
+        if int(record.get("generation", -1)) <= generation and _record_grounded(record)
+    ]
+    if not candidates:
+        raise SystemExit(
+            "no grounded/control-stable timeline record exists at or before "
+            f"generation {generation}; choose a larger lead or inspect the timeline"
+        )
+    return max(candidates, key=lambda record: int(record.get("generation", -1)))
 
 
 def timeline_to_checkpoint_generation(timeline_generation: int) -> int:
@@ -145,6 +188,14 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="rewind this many 4-frame timeline generations before the selected event (default: 8)",
     )
+    p.add_argument(
+        "--stable-root",
+        action="store_true",
+        help=(
+            "after applying --lead-generations, rewind farther if needed to the latest "
+            "grounded/control-stable timeline record"
+        ),
+    )
     p.add_argument("--output-root", type=Path, default=Path("build/scenarios"))
     p.add_argument(
         "--checkpoint-search-root",
@@ -182,6 +233,11 @@ def main() -> int:
         selected_timeline_generation - max(0, args.lead_generations),
     )
     desired_record = _record_for_generation(records, desired_timeline_generation)
+    if args.stable_root:
+        desired_record = _stable_record_at_or_before(
+            records,
+            int(desired_record.get("generation", desired_timeline_generation)),
+        )
     desired_timeline_generation = int(
         desired_record.get("generation", desired_timeline_generation)
     )
@@ -221,6 +277,7 @@ def main() -> int:
     dest_state = scenario_dir / "root.mss"
     shutil.copy2(source_state, dest_state)
 
+    root_radar = root_record.get("radar") or {}
     manifest = {
         "schema": "fami-pixel-smb1-scenario-v2",
         "id": args.scenario_id,
@@ -229,6 +286,9 @@ def main() -> int:
         "root_checkpoint_generation": actual_checkpoint_generation,
         "requested_root_generation": desired_timeline_generation,
         "requested_checkpoint_generation": desired_checkpoint_generation,
+        "root_policy": "stable" if args.stable_root else "lead",
+        "root_grounded": _record_grounded(root_record),
+        "root_player_vy": root_radar.get("player_vy"),
         "native_frame": root_record.get("native_frame"),
         "mario_x": root_record.get("mario_x"),
         "mario_y": root_record.get("mario_y"),
@@ -252,10 +312,14 @@ def main() -> int:
         )
     print(
         f"Timeline   : {root_timeline_generation} "
-        f"(selected {selected_timeline_generation}, lead {args.lead_generations})"
+        f"(selected {selected_timeline_generation}, lead {args.lead_generations}, "
+        f"policy={manifest['root_policy']})"
     )
     print(f"Checkpoint : {actual_checkpoint_generation}")
-    print(f"Mario      : X={manifest['mario_x']} frame={manifest['native_frame']}")
+    print(
+        f"Mario      : X={manifest['mario_x']} Y={manifest['mario_y']} "
+        f"frame={manifest['native_frame']} grounded={int(bool(manifest['root_grounded']))}"
+    )
     print(f"Source     : {source_state}")
     print(f"State      : {dest_state}")
     print(f"Manifest   : {manifest_path}")
