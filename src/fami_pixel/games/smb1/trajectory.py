@@ -1,7 +1,7 @@
 """Authoritative event-horizon trajectory evaluation for SMB1.
 
 This module is the first executable building block of the forward-model planner
-tracked by GitHub issue #32.  It deliberately does not guess Mario physics.
+tracked by GitHub issue #32. It deliberately does not guess Mario physics.
 Instead, callers restore a Mesen save-state branch and this evaluator applies a
 bounded action sequence until a meaningful authoritative event occurs.
 
@@ -128,7 +128,7 @@ def _target_reward_collected(
     """Return only collection evidence proven by current native capability state.
 
     Mushroom / Fire Flower collection is proven by PlayerStatus increasing.
-    Star collection is proven by the invincibility timer increasing.  The native
+    Star collection is proven by the invincibility timer increasing. The native
     radar does not yet expose an authoritative lives counter, so 1-Up collection
     is intentionally not claimed here merely because its object disappears.
     """
@@ -161,12 +161,17 @@ def evaluate_mesen_trajectory(
     step_timeout_s: float = 2.0,
     target_reward_type: str | None = None,
     start_observation: Smb1Observation | None = None,
+    stop_on_landing: bool = True,
 ) -> TrajectoryResult:
     """Simulate one trajectory until an authoritative event or hard horizon.
 
     The caller is responsible for restoring the desired branch root before this
-    function is called.  Only port 0 controller state and emulated state advance
+    function is called. Only port 0 controller state and emulated state advance
     are modified here.
+
+    ``stop_on_landing=False`` is useful for explicit COLLECT objectives: a branch
+    may land safely and still need several more frames to intercept the target.
+    Landing evidence is retained in the result even when it is not terminal.
     """
 
     if max_horizon_frames <= 0:
@@ -217,6 +222,8 @@ def evaluate_mesen_trajectory(
             landed_now = airborne_seen and any(
                 item.kind == GameEventType.LANDED for item in events
             )
+            if landed_now:
+                landed = True
             capability_changed = _capability_changed(start_radar, current_radar)
             reward_collected = _target_reward_collected(
                 target_reward_type,
@@ -225,8 +232,7 @@ def evaluate_mesen_trajectory(
             )
 
             # Terminal ordering is deliberate. Death/win dominate everything;
-            # a proven target collection dominates a generic capability change;
-            # landing ends a navigation branch only after airborne evidence.
+            # a proven target collection dominates a generic capability change.
             if died:
                 event = TrajectoryEvent.DEATH
             elif won:
@@ -235,8 +241,7 @@ def evaluate_mesen_trajectory(
                 event = TrajectoryEvent.REWARD_COLLECTED
             elif capability_changed:
                 event = TrajectoryEvent.CAPABILITY_CHANGED
-            elif landed_now:
-                landed = True
+            elif landed_now and stop_on_landing:
                 event = TrajectoryEvent.LANDED
             else:
                 previous = current
