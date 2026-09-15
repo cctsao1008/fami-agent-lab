@@ -2,8 +2,7 @@
 
 The collector still uses Mesen as the only transition oracle. These helpers
 only choose which non-terminal counterfactual outcomes should become future
-root states so the dataset covers more decision boundaries than a single greedy
-trajectory.
+root states or receive extended neutral death probes.
 """
 
 from __future__ import annotations
@@ -18,17 +17,7 @@ def _is_non_terminal(outcome) -> bool:
 
 
 def select_hazard_branches(outcomes: Iterable, width: int = 3) -> tuple:
-    """Pick diverse surviving outcomes for breadth-first teacher expansion.
-
-    Priority intentionally mixes three views of the same root:
-    - lowest progress: seeks stalled/regressive states and nearby hazards;
-    - closest-to-zero progress: follows decision-boundary-like transitions;
-    - highest progress/max-X: preserves a viable forward trajectory.
-
-    Remaining slots are filled from low to high progress. Terminal outcomes
-    are never promoted to child roots; they remain valuable labelled samples at
-    the current root.
-    """
+    """Pick diverse surviving outcomes for breadth-first teacher expansion."""
     width = int(width)
     if width <= 0:
         raise ValueError("width must be > 0")
@@ -69,6 +58,65 @@ def select_hazard_branches(outcomes: Iterable, width: int = 3) -> tuple:
     return tuple(chosen)
 
 
+def select_death_probe_candidates(outcomes: Iterable, width: int = 6) -> tuple:
+    """Pick surviving outcomes worth extending with neutral Mesen rollout.
+
+    The probe set deliberately covers both obviously weak actions and forward
+    actions that may have crossed a delayed-death boundary. Immediate terminal
+    outcomes do not need probing because they already carry authoritative
+    terminal labels.
+    """
+    width = int(width)
+    if width <= 0:
+        raise ValueError("width must be > 0")
+
+    safe = [outcome for outcome in outcomes if _is_non_terminal(outcome)]
+    if not safe:
+        return ()
+
+    ordered = sorted(
+        safe,
+        key=lambda o: (int(o.progress), int(o.max_x), str(o.candidate.name)),
+    )
+    low = ordered[0]
+    boundary = min(
+        safe,
+        key=lambda o: (abs(int(o.progress)), int(o.progress), int(o.max_x), str(o.candidate.name)),
+    )
+    leader = max(
+        safe,
+        key=lambda o: (int(o.max_x), int(o.progress), str(o.candidate.name)),
+    )
+
+    chosen = []
+    seen = set()
+
+    def add(outcome) -> None:
+        name = str(outcome.candidate.name)
+        if name not in seen:
+            chosen.append(outcome)
+            seen.add(name)
+
+    for outcome in (low, boundary, leader):
+        add(outcome)
+        if len(chosen) >= width:
+            return tuple(chosen)
+
+    # Fill from both ends so delayed-death probes do not collapse to only
+    # stalled actions or only forward actions.
+    left = 0
+    right = len(ordered) - 1
+    while len(chosen) < width and left <= right:
+        add(ordered[left])
+        left += 1
+        if len(chosen) >= width or left > right:
+            break
+        add(ordered[right])
+        right -= 1
+
+    return tuple(chosen)
+
+
 def _entry_state_distance(left, right) -> tuple[int, int]:
     a = tuple(int(v) for v in left.state_signature)
     b = tuple(int(v) for v in right.state_signature)
@@ -78,19 +126,7 @@ def _entry_state_distance(left, right) -> tuple[int, int]:
 
 
 def select_depth_beam(entries: Iterable, width: int = 3, x_window: int = 96) -> tuple:
-    """Prune one expanded layer to a small forward-moving hazard beam.
-
-    Entries are collector-owned child records with ``child_x``, ``outcome`` and
-    ``state_signature`` attributes. Selection keeps the search deep while still
-    retaining decision-boundary diversity:
-
-    1. forward leader: farthest surviving child;
-    2. boundary child: progress nearest zero, but only near the current frontier;
-    3. state-diverse child: most different state signature near the frontier.
-
-    Remaining slots are filled by forward position. ``x_window`` prevents the
-    beam from spending later depths on shallow states far behind the leader.
-    """
+    """Prune one expanded layer to a small forward-moving hazard beam."""
     width = int(width)
     x_window = int(x_window)
     if width <= 0:
