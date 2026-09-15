@@ -122,24 +122,95 @@ def reward_object_is_active(reward: dict | None) -> bool:
     return bool(state & 0x80)
 
 
+def _signed_byte(value: int) -> int:
+    value = int(value) & 0xFF
+    return value - 0x100 if value & 0x80 else value
+
+
+def reward_intercept_key_2d(
+    *,
+    reward: dict | None,
+    nearest_enemy_dx: int | None,
+    mario_x: int,
+    mario_y: int,
+    player_x_speed: int = 0,
+) -> tuple[int, int, int, int, int, int, int]:
+    """Rank an interception frontier using native X/Y geometry plus momentum.
+
+    The V24 Star replay demonstrated why ``abs(dx)`` alone is insufficient. At
+    depth 16 Mario and the Star both reached world X=1616, yet collection did not
+    occur; after the Star entered state ``0x80`` it moved right and the 1-D beam
+    settled into a ~28 px trailing state.  The missing variable is the vertical
+    interception geometry, with horizontal momentum useful only as a secondary
+    closing hint.
+
+    Ordering is deliberately lexicographic and remains non-authoritative:
+
+    1. keep the target tracked,
+    2. prefer a natively active/released target,
+    3. prefer a loose 2-D overlap envelope,
+    4. reduce Manhattan X/Y separation,
+    5. prefer horizontal velocity that closes the current X error,
+    6. retain enemy clearance,
+    7. reduce horizontal separation as the final deterministic tie-breaker.
+
+    The loose overlap envelope is only a search hint. Collection is still proven
+    exclusively by ``reward_collection_proven()`` from native capability state.
+    """
+
+    if reward is None:
+        return (0, 0, 0, -1_000_000, -1_000_000, -1_000_000, -1_000_000)
+
+    dx = int(reward.get("dx", 0))
+    try:
+        reward_y = int(reward.get("y", mario_y))
+    except (TypeError, ValueError):
+        reward_y = int(mario_y)
+    dy = reward_y - int(mario_y)
+    active = 1 if reward_object_is_active(reward) else 0
+
+    # SMB1 sprites are roughly one tile in this interaction. Keep this envelope
+    # intentionally loose: it is for beam ordering only, never collision proof.
+    overlap_hint = 1 if abs(dx) <= 16 and abs(dy) <= 24 else 0
+    spatial_distance = abs(dx) + abs(dy)
+
+    vx = _signed_byte(player_x_speed)
+    if dx > 4:
+        closing = vx
+    elif dx < -4:
+        closing = -vx
+    else:
+        # Near horizontal alignment, do not invent a target-velocity model.
+        closing = 0
+
+    if nearest_enemy_dx is None:
+        clearance = 255
+    else:
+        enemy_dx = int(nearest_enemy_dx)
+        clearance = max(0, min(255, enemy_dx)) if enemy_dx >= 0 else 255
+
+    return (
+        1,
+        active,
+        overlap_hint,
+        -spatial_distance,
+        closing,
+        clearance,
+        -abs(dx),
+    )
+
+
 def reward_beam_key(
     *,
     reward: dict | None,
     nearest_enemy_dx: int | None,
     mario_x: int,
 ) -> tuple[int, int, int, int, int]:
-    """Rank alive intermediate states for COLLECT without progress domination.
+    """Rank alive intermediate states for the original 1-D COLLECT probe.
 
-    Ordering is deliberately lexicographic:
-
-    1. keep the target visible,
-    2. prefer a natively active/released target over one still emerging,
-    3. reduce absolute interception distance,
-    4. retain clearance from an enemy immediately ahead,
-    5. use Mario X only as a final deterministic tie-breaker.
-
-    A collected reward is handled as a terminal success by the caller and never
-    reaches this intermediate-state ranking.
+    This key is retained for the V1/V2 laboratory probes and backward-compatible
+    tests. New interception work should prefer ``reward_intercept_key_2d`` so a
+    horizontal crossing is not mistaken for an actual collection opportunity.
     """
 
     if reward is None:
