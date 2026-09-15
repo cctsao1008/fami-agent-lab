@@ -53,7 +53,9 @@ from fami_pixel.games.smb1.reward_target import read_active_reward_target
 import mesen_smb_checkpoint_planner as base
 import mesen_smb_checkpoint_planner_v11 as v11
 import mesen_smb_checkpoint_planner_v14 as v14
+import mesen_smb_checkpoint_planner_v15 as v15
 import mesen_smb_checkpoint_planner_v17 as v17
+import mesen_smb_checkpoint_planner_v20 as v20
 import mesen_smb_checkpoint_planner_v23 as v23
 import mesen_smb_checkpoint_planner_v24 as v24
 
@@ -61,7 +63,7 @@ import mesen_smb_checkpoint_planner_v24 as v24
 PLANNER_NAME = "v25-live-reward-intercept"
 _REWARD_PREFIX_FRAMES = 4
 _LIVE_OBJECTIVE = StickyCollectObjective(ttl_frames=24)
-_BASE_RADAR_READ = v17.read_smb1_radar
+_BASE_LANDING_RADAR = v20._tracking_landing_radar
 _BASE_FORWARD_LABEL = v23._forward_schedule_label
 _BASE_V24_AUTHORITY = v24.authority_main
 
@@ -80,10 +82,14 @@ def _collect_target_from_radar(radar: dict) -> str | None:
     return None
 
 
-def _augmenting_read_smb1_radar(core, *, player_x: int, **kwargs):
-    """Preserve normal radar semantics while attaching a sticky reward objective."""
+def _augmenting_landing_radar(core, *, player_x: int, lookahead_px: int = 192):
+    """Preserve V20 landing/reward telemetry and attach a sticky COLLECT target."""
 
-    normal = _BASE_RADAR_READ(core, player_x=player_x, **kwargs)
+    normal = _BASE_LANDING_RADAR(
+        core,
+        player_x=player_x,
+        lookahead_px=lookahead_px,
+    )
     payload = normal.to_payload()
     try:
         tracked = read_active_reward_target(core, player_x=player_x)
@@ -439,7 +445,6 @@ def _v25_schedule_label(candidate_name: str) -> str:
 
 def authority_main(args) -> int:
     _LIVE_OBJECTIVE.clear()
-    v17.read_smb1_radar = _augmenting_read_smb1_radar
     v11._log(
         "Planner V25: sticky COLLECT objective enabled | "
         f"reward-prefix={_REWARD_PREFIX_FRAMES}f vocab={len(REWARD_BEAM_CHUNKS_WITH_HOLD)} "
@@ -449,6 +454,11 @@ def authority_main(args) -> int:
 
 
 def _install_v25_overrides() -> None:
+    # V23 authority installs V20 after this wrapper starts. Patch V20's radar
+    # source rather than V17 directly so landing/cluster fields survive that
+    # installation and the request sent to shadow workers carries COLLECT state.
+    v20._tracking_landing_radar = _augmenting_landing_radar
+
     v23.PLANNER_NAME = PLANNER_NAME
     v23.shadow_worker_main = shadow_worker_main
     v23._best_forward_plan = _best_v25_plan
