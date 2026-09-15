@@ -42,6 +42,11 @@ def _validate_fractions(train_fraction: float, validation_fraction: float) -> No
         raise ValueError("train_fraction + validation_fraction must be < 1")
 
 
+def _is_risk_target(row: dict) -> bool:
+    target = row["target"]
+    return bool(target.get("death")) or bool(target.get("doomed_within_probe"))
+
+
 def split_rollout_records(
     records: Iterable[dict],
     *,
@@ -83,8 +88,8 @@ def split_rollout_records(
 
 
 def _hazard_class(rows: list[dict]) -> str:
-    if any(bool(row["target"].get("death")) for row in rows):
-        return "death"
+    if any(_is_risk_target(row) for row in rows):
+        return "risk"
     if any(bool(row["target"].get("no_progress")) for row in rows):
         return "no_progress"
     return "neutral"
@@ -104,11 +109,10 @@ def split_rollout_records_stratified(
 
     The unit of assignment remains the whole (source, generation) Mesen root,
     so sibling candidate rollouts cannot leak across partitions. Root groups are
-    bucketed as death, no-progress, or neutral and deterministically shuffled by
-    a stable hash before each bucket is partitioned. This gives model-selection
-    partitions hazard coverage when the dataset contains at least three groups
-    in a hazard class, while the chronological split remains available as a
-    separate distribution-shift stress test.
+    bucketed as risk (immediate death or delayed doomed probe), no-progress, or
+    neutral and deterministically shuffled by a stable hash before each bucket
+    is partitioned. The chronological split remains a separate distribution-
+    shift stress test.
     """
     _validate_fractions(train_fraction, validation_fraction)
 
@@ -124,7 +128,7 @@ def split_rollout_records_stratified(
         buckets[_hazard_class(rows)].append((key, rows))
 
     split = {"train": [], "validation": [], "test": []}
-    for hazard in ("death", "no_progress", "neutral"):
+    for hazard in ("risk", "no_progress", "neutral"):
         items = buckets.get(hazard, [])
         items.sort(key=lambda item: _stable_group_order(item[0]))
         n_train, n_validation, _ = _partition_counts(len(items), train_fraction, validation_fraction)
@@ -152,16 +156,26 @@ def summarize_partition(records: Iterable[dict]) -> dict:
     vxs = [int(row["start"]["vx"]) for row in rows]
     vys = [int(row["start"]["vy"]) for row in rows]
     hazard_groups = defaultdict(int)
+    death_groups = 0
+    doomed_groups = 0
     for root_rows in grouped_rows.values():
         hazard_groups[_hazard_class(root_rows)] += 1
+        if any(bool(row["target"].get("death")) for row in root_rows):
+            death_groups += 1
+        if any(bool(row["target"].get("doomed_within_probe")) for row in root_rows):
+            doomed_groups += 1
     return {
         "records": len(rows),
         "root_groups": len(groups),
         "sources": sources,
-        "death_groups": hazard_groups["death"],
+        "risk_groups": hazard_groups["risk"],
+        "death_groups": death_groups,
+        "doomed_groups": doomed_groups,
         "no_progress_groups": hazard_groups["no_progress"],
         "neutral_groups": hazard_groups["neutral"],
+        "risk_records": sum(_is_risk_target(row) for row in rows),
         "death_records": sum(bool(row["target"].get("death")) for row in rows),
+        "doomed_records": sum(bool(row["target"].get("doomed_within_probe")) for row in rows),
         "no_progress_records": sum(bool(row["target"].get("no_progress")) for row in rows),
         "delta_x_mean": mean(delta_x) if delta_x else None,
         "delta_x_min": min(delta_x) if delta_x else None,
@@ -201,9 +215,9 @@ def candidate_mean_baseline(train: Iterable[dict], evaluate: Iterable[dict]) -> 
             rows,
             key=lambda row: candidate_means.get(str(row["candidate"]["name"]), global_mean),
         )
-        actual_best = max(rows, key=lambda row: int(row["target"]["delta_x"]))
+        actual_best_delta = max(int(row["target"]["delta_x"]) for row in rows)
         ranking_groups += 1
-        if predicted_best["candidate"]["name"] == actual_best["candidate"]["name"]:
+        if int(predicted_best["target"]["delta_x"]) == actual_best_delta:
             ranking_correct += 1
 
     return {
