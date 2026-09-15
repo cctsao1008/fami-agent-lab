@@ -28,6 +28,13 @@ from .radar import (
     POWER_UP_SLOT,
 )
 
+# Native SMB object-motion fields from the canonical SMB1 disassembly family.
+# Enemy arrays use slot-relative addressing; the power-up occupies slot 5.
+ADDR_ENEMY_X_SPEED = 0x0058
+ADDR_ENEMY_Y_SPEED = 0x00A0
+ADDR_ENEMY_X_MOVE_FORCE = 0x0401
+ADDR_ENEMY_Y_MOVE_FORCE = 0x0434
+
 
 def decode_active_reward_target(
     ram: bytes,
@@ -40,6 +47,10 @@ def decode_active_reward_target(
 
     ``behind_px`` is deliberately much larger than the normal forward-radar
     trailing allowance.  This is target tracking, not hazard sensing.
+
+    The returned payload also preserves the native horizontal/vertical speed and
+    subpixel movement-force bytes.  They are observation data only; Mesen remains
+    the transition authority and collection is still proven from capability state.
     """
 
     if behind_px < 0 or ahead_px < 0:
@@ -52,6 +63,10 @@ def decode_active_reward_target(
         ADDR_ENEMY_X + POWER_UP_SLOT,
         ADDR_ENEMY_Y_HIGH + POWER_UP_SLOT,
         ADDR_ENEMY_Y + POWER_UP_SLOT,
+        ADDR_ENEMY_X_SPEED + POWER_UP_SLOT,
+        ADDR_ENEMY_Y_SPEED + POWER_UP_SLOT,
+        ADDR_ENEMY_X_MOVE_FORCE + POWER_UP_SLOT,
+        ADDR_ENEMY_Y_MOVE_FORCE + POWER_UP_SLOT,
         ADDR_POWER_UP_TYPE,
     ):
         raise ValueError("RAM snapshot is too small for SMB1 reward tracking")
@@ -78,6 +93,10 @@ def decode_active_reward_target(
         "x": world_x,
         "y": int(ram[ADDR_ENEMY_Y + slot]),
         "dx": dx,
+        "x_speed": int(ram[ADDR_ENEMY_X_SPEED + slot]),
+        "y_speed": int(ram[ADDR_ENEMY_Y_SPEED + slot]),
+        "x_move_force": int(ram[ADDR_ENEMY_X_MOVE_FORCE + slot]),
+        "y_move_force": int(ram[ADDR_ENEMY_Y_MOVE_FORCE + slot]),
     }
 
 
