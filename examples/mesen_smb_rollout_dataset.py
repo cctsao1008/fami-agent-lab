@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--run-tag",
+        default="",
+        help=(
+            "optional source-identity suffix for independent append runs "
+            "(letters, digits, dot, underscore, hyphen only)"
+        ),
+    )
+    parser.add_argument(
         "--branch-width",
         type=int,
         default=3,
@@ -117,6 +125,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--death-probe-frames must be > 0")
     if args.death_probe_width <= 0:
         parser.error("--death-probe-width must be > 0")
+    run_tag = str(args.run_tag).strip()
+    if run_tag and any(not (ch.isalnum() or ch in "._-") for ch in run_tag):
+        parser.error("--run-tag may contain only letters, digits, dot, underscore, and hyphen")
+    args.run_tag = run_tag
     return args
 
 
@@ -159,12 +171,22 @@ def _state_signature(observation) -> tuple[int, int, int, int, int, int]:
 def _source_name(args: argparse.Namespace) -> str:
     base_name = f"offline-{args.candidate_set}"
     if args.sampling == "greedy":
-        return base_name
-    if args.sampling == "hazard":
-        return f"{base_name}-hazard"
-    if args.sampling == "hazard-beam":
-        return f"{base_name}-hazard-beam"
-    return f"{base_name}-hazard-beam-probe"
+        source = base_name
+    elif args.sampling == "hazard":
+        source = f"{base_name}-hazard"
+    elif args.sampling == "hazard-beam":
+        source = f"{base_name}-hazard-beam"
+    else:
+        source = f"{base_name}-hazard-beam-probe"
+    if args.run_tag:
+        source = f"{source}-{args.run_tag}"
+    return source
+
+
+def _checkpoint_prefix(args: argparse.Namespace) -> str:
+    if not args.run_tag:
+        return args.sampling
+    return f"{args.sampling}-{args.run_tag}"
 
 
 def _probe_settings(args: argparse.Namespace) -> tuple[int, int]:
@@ -261,8 +283,9 @@ def _evaluate_root(
 
 def _collect_greedy(core, args, candidates, checkpoint_dir: Path, output: Path, source: str, current):
     records = 0
+    prefix = _checkpoint_prefix(args)
     for root_index in range(args.roots):
-        checkpoint = checkpoint_dir / f"root-{root_index:04d}.mss"
+        checkpoint = checkpoint_dir / f"{prefix}-root-{root_index:04d}.mss"
         root_frame, root_x, root_engine = base.save_checkpoint(core, checkpoint)
         start = observation_from_state(core.frame_count(), read_smb1_state(core))
         evaluated = _evaluate_root(
@@ -287,7 +310,8 @@ def _collect_greedy(core, args, candidates, checkpoint_dir: Path, output: Path, 
 
 
 def _collect_hazard(core, args, candidates, checkpoint_dir: Path, output: Path, source: str, current):
-    initial = checkpoint_dir / "hazard-root-0000.mss"
+    prefix = _checkpoint_prefix(args)
+    initial = checkpoint_dir / f"{prefix}-root-0000.mss"
     root_frame, root_x, root_engine = base.save_checkpoint(core, initial)
     frontier = deque([(initial, root_frame, root_x, root_engine)])
     seen_states = {_state_signature(current)}
@@ -323,7 +347,7 @@ def _collect_hazard(core, args, candidates, checkpoint_dir: Path, output: Path, 
             if signature in seen_states:
                 continue
             seen_states.add(signature)
-            child_path = checkpoint_dir / f"hazard-child-{root_index:04d}-{branch_index:02d}.mss"
+            child_path = checkpoint_dir / f"{prefix}-child-{root_index:04d}-{branch_index:02d}.mss"
             child_frame, child_x, child_engine = base.save_checkpoint(core, child_path)
             frontier.append((child_path, child_frame, child_x, child_engine))
             current = child
@@ -331,7 +355,8 @@ def _collect_hazard(core, args, candidates, checkpoint_dir: Path, output: Path, 
 
 
 def _collect_hazard_beam(core, args, candidates, checkpoint_dir: Path, output: Path, source: str, current):
-    initial_path = checkpoint_dir / f"{args.sampling}-root-0000.mss"
+    prefix = _checkpoint_prefix(args)
+    initial_path = checkpoint_dir / f"{prefix}-root-0000.mss"
     root_frame, root_x, root_engine = base.save_checkpoint(core, initial_path)
     beam = [_RootState(initial_path, root_frame, root_x, root_engine)]
     seen_states = {_state_signature(current)}
@@ -375,7 +400,7 @@ def _collect_hazard_beam(core, args, candidates, checkpoint_dir: Path, output: P
                     continue
                 seen_states.add(signature)
                 child_path = checkpoint_dir / (
-                    f"{args.sampling}-d{depth:03d}-r{root_index:04d}-b{branch_index:02d}.mss"
+                    f"{prefix}-d{depth:03d}-r{root_index:04d}-b{branch_index:02d}.mss"
                 )
                 child_frame, child_x, child_engine = base.save_checkpoint(core, child_path)
                 expanded.append(
@@ -449,6 +474,8 @@ def collector_main(args: argparse.Namespace) -> int:
     print(f"Teacher roots : {args.roots}", flush=True)
     print(f"Candidates    : {len(candidates)} ({args.candidate_set})", flush=True)
     print(f"Sampling      : {args.sampling}", flush=True)
+    if args.run_tag:
+        print(f"Run tag       : {args.run_tag}", flush=True)
     if args.sampling in ("hazard", "hazard-beam", "hazard-beam-probe"):
         print(f"Branch width  : {args.branch_width}", flush=True)
     if args.sampling == "hazard-beam-probe":
