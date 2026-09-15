@@ -44,7 +44,8 @@ def main() -> int:
         "architecture": {
             "input_features": input_size,
             "hidden_units": args.hidden,
-            "outputs": ["delta_x", "death_probability", "no_progress_probability"],
+            "outputs": ["delta_x", "risk_probability", "no_progress_probability"],
+            "risk_target": "death OR doomed_within_probe",
             "epochs": args.epochs,
             "learning_rate": args.learning_rate,
             "seed": args.seed,
