@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 
-from fami_pixel.learning.hazard_sampling import select_depth_beam, select_hazard_branches
+from fami_pixel.learning.hazard_sampling import (
+    select_death_probe_candidates,
+    select_depth_beam,
+    select_hazard_branches,
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,35 @@ def test_hazard_branch_selection_never_promotes_terminal_children():
 def test_hazard_branch_selection_validates_width():
     try:
         select_hazard_branches([_outcome("safe", 1)], width=0)
+    except ValueError as exc:
+        assert "width" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_death_probe_selection_covers_low_boundary_and_forward_survivors():
+    outcomes = [
+        _outcome("dead", 5, terminal="death"),
+        _outcome("regress", -6, max_x=12),
+        _outcome("boundary", 0, max_x=20),
+        _outcome("middle", 12, max_x=35),
+        _outcome("leader", 30, max_x=55),
+    ]
+
+    selected = select_death_probe_candidates(outcomes, width=3)
+    names = tuple(outcome.candidate.name for outcome in selected)
+
+    assert names == ("regress", "boundary", "leader")
+    assert "dead" not in names
+
+
+def test_death_probe_selection_validates_width_and_ignores_terminal_only_input():
+    assert select_death_probe_candidates(
+        [_outcome("dead", 0, terminal="death")], width=3
+    ) == ()
+
+    try:
+        select_death_probe_candidates([_outcome("safe", 1)], width=0)
     except ValueError as exc:
         assert "width" in str(exc)
     else:
