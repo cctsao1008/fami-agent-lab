@@ -4,6 +4,12 @@
 This is a lab tool for issue #32, not yet the live V23 authority planner. It lets
 us test real Mesen futures from a deterministic local checkpoint before wiring
 the same evaluator into the asynchronous live search.
+
+A hard horizon is *not* a safety result. It means the branch is unresolved: the
+simulator has not yet observed death, win, reward collection, capability change,
+or (for navigation objectives) a landing. The probe therefore marks an all-
+horizon comparison as provisional instead of presenting forward progress as a
+safe authoritative choice.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from fami_pixel.adapters.mesen import MesenCore, configure_standard_nes_controll
 from fami_pixel.games.smb1 import (
     ActionCommand,
     Smb1Action,
+    TrajectoryEvent,
     TrajectoryPlan,
     evaluate_mesen_trajectory,
     observation_from_state,
@@ -82,7 +89,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("scenario_dir", type=Path)
     p.add_argument("--dll", type=Path, default=Path("build/mesen/MesenCore.dll"))
     p.add_argument("--home", type=Path, default=Path("build/mesen-home-trajectory-probe"))
-    p.add_argument("--max-horizon", type=int, default=96)
+    p.add_argument(
+        "--max-horizon",
+        type=int,
+        default=320,
+        help=(
+            "hard branch budget in frames (default: 320). Hitting this limit is "
+            "UNRESOLVED, not proof that the trajectory is safe"
+        ),
+    )
     p.add_argument("--step-timeout", type=float, default=2.0)
     p.add_argument("--target-reward", choices=("mushroom", "fire_flower", "star", "one_up"))
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -142,7 +157,7 @@ def worker(args: argparse.Namespace) -> int:
     print(f"Scenario   : {manifest.get('id')}", flush=True)
     print(f"Root       : generation={manifest.get('root_generation')} frame={manifest.get('native_frame')} X={manifest.get('mario_x')}", flush=True)
     print(f"Target     : {target_reward or 'navigation'}", flush=True)
-    print(f"Horizon    : {args.max_horizon} frames", flush=True)
+    print(f"Horizon    : {args.max_horizon} frames (hard cap; horizon event = UNRESOLVED)", flush=True)
 
     results = []
     try:
@@ -160,21 +175,36 @@ def worker(args: argparse.Namespace) -> int:
             )
             results.append(result)
             approach = result.target_approach
+            status = "UNRESOLVED" if result.event == TrajectoryEvent.HORIZON else "RESOLVED"
             print(
                 f"{plan.name:12s} event={result.event.value:19s} "
-                f"frames={result.frames_simulated:3d} dx={result.progress:+4d} "
-                f"maxdx={result.max_progress:+4d} landed={int(result.landed)} "
-                f"reward={int(result.reward_collected)} "
+                f"status={status:10s} frames={result.frames_simulated:3d} "
+                f"dx={result.progress:+4d} maxdx={result.max_progress:+4d} "
+                f"y={result.start_y:3d}->{result.end_y:3d} "
+                f"landed={int(result.landed)} reward={int(result.reward_collected)} "
                 f"approach={'--' if approach is None else f'{approach:+d}'}",
                 flush=True,
             )
 
         best = max(results, key=trajectory_outcome_key)
-        print(
-            f"SELECT     : {best.plan.name} -> {best.event.value} "
-            f"key={trajectory_outcome_key(best)}",
-            flush=True,
-        )
+        resolved = [result for result in results if result.event != TrajectoryEvent.HORIZON]
+        if resolved:
+            best_resolved = max(resolved, key=trajectory_outcome_key)
+            print(
+                f"SELECT     : {best_resolved.plan.name} -> {best_resolved.event.value} "
+                f"key={trajectory_outcome_key(best_resolved)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"PROVISIONAL: {best.plan.name} -> horizon key={trajectory_outcome_key(best)}",
+                flush=True,
+            )
+            print(
+                "WARNING    : all branches hit the hard horizon; no trajectory has "
+                "authoritative safety/landing evidence. Increase --max-horizon.",
+                flush=True,
+            )
         print(_DONE, flush=True)
         return 0
     finally:
