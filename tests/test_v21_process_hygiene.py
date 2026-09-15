@@ -1,14 +1,20 @@
 import importlib.util
 from pathlib import Path
+import sys
 
 
 def _load_v21():
-    path = Path(__file__).resolve().parents[1] / "examples" / "mesen_smb_checkpoint_planner_v21.py"
-    spec = importlib.util.spec_from_file_location("fami_pixel_v21", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    examples_dir = Path(__file__).resolve().parents[1] / "examples"
+    path = examples_dir / "mesen_smb_checkpoint_planner_v21.py"
+    sys.path.insert(0, str(examples_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("fami_pixel_v21", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(examples_dir))
 
 
 def test_parse_shadow_pids_from_authority_log():
