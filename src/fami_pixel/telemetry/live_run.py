@@ -106,9 +106,11 @@ class LiveRunArtifacts:
         state = observation_payload(observation)
         radar_payload = dict(radar or {})
 
-        (self.path / "final-frame.png").write_bytes(raw_frame_to_png(frame))
+        # Persist the cheap structured evidence first. If framebuffer encoding or
+        # writing later fails, the run still leaves useful state/radar evidence.
         _write_json(self.path / "final-state.json", state)
         _write_json(self.path / "final-radar.json", radar_payload)
+        (self.path / "final-frame.png").write_bytes(raw_frame_to_png(frame))
         _write_json(
             self.path / "summary.json",
             {
