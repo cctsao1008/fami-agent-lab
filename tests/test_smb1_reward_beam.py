@@ -4,6 +4,7 @@ from fami_pixel.games.smb1.reward_beam import (
     matching_reward,
     reward_beam_key,
     reward_collection_proven,
+    reward_intercept_key_2d,
     reward_object_is_active,
 )
 
@@ -77,6 +78,42 @@ def test_reward_beam_prefers_near_target_over_progress_within_same_phase():
         mario_x=1800,
     )
     assert near > far > missing
+
+
+def test_2d_intercept_prefers_vertical_alignment_not_x_only_crossing():
+    aligned = reward_intercept_key_2d(
+        reward={"type": "star", "dx": 6, "y": 152, "state": 0x80},
+        nearest_enemy_dx=60,
+        mario_x=1610,
+        mario_y=152,
+        player_x_speed=8,
+    )
+    x_only = reward_intercept_key_2d(
+        reward={"type": "star", "dx": 0, "y": 120, "state": 0x80},
+        nearest_enemy_dx=60,
+        mario_x=1616,
+        mario_y=176,
+        player_x_speed=0,
+    )
+    assert aligned > x_only
+
+
+def test_2d_intercept_uses_directional_momentum_as_secondary_hint():
+    closing = reward_intercept_key_2d(
+        reward={"type": "star", "dx": 24, "y": 176, "state": 0x80},
+        nearest_enemy_dx=80,
+        mario_x=1600,
+        mario_y=176,
+        player_x_speed=12,
+    )
+    moving_away = reward_intercept_key_2d(
+        reward={"type": "star", "dx": 24, "y": 176, "state": 0x80},
+        nearest_enemy_dx=80,
+        mario_x=1600,
+        mario_y=176,
+        player_x_speed=0xF4,  # -12 signed
+    )
+    assert closing > moving_away
 
 
 def test_buttons_for_chunk_frame_covers_exact_schedule():
