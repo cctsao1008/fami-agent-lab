@@ -37,6 +37,7 @@ from fami_pixel.games.smb1 import (
     observation_from_state,
     read_smb1_state,
 )
+from fami_pixel.learning.tiny_mlp import TinySurrogateMLP
 from fami_pixel.telemetry import NesWebViewer
 
 import mesen_smb_checkpoint_planner as base
@@ -86,6 +87,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--control-quantum", type=int, default=CONTROL_QUANTUM)
     p.add_argument("--plan-freshness", type=int, default=PLAN_FRESHNESS_FRAMES)
     p.add_argument("--shadow-workers", type=int, default=DEFAULT_SHADOW_WORKERS)
+    p.add_argument(
+        "--surrogate-model",
+        type=Path,
+        help="optional trained TinySurrogateMLP JSON artifact scored by each shadow worker",
+    )
+    p.add_argument("--surrogate-risk-penalty", type=float, default=24.0)
+    p.add_argument("--surrogate-no-progress-penalty", type=float, default=8.0)
+    p.add_argument("--surrogate-dx-weight", type=float, default=0.25)
     p.add_argument("--authority-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--shadow-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--worker-index", type=int, default=0, help=argparse.SUPPRESS)
@@ -103,21 +112,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def _atomic_json(path: Path, payload: dict) -> bool:
-    """Publish latest-value IPC without letting Windows sharing races stop authority.
-
-    On Windows a reader can briefly hold the destination JSON open, causing
-    ``os.replace`` to fail with WinError 5/32.  V11 is a latest-value protocol:
-    a missed snapshot/result is preferable to blocking or killing the live plant.
-    Use a unique temp file, retry only for a few milliseconds, then drop this
-    publication and let the next generation supersede it.
-    """
+    """Publish latest-value IPC without letting Windows sharing races stop authority."""
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, separators=(",", ":"))
 
     for attempt in range(_IPC_REPLACE_ATTEMPTS):
-        tmp = path.with_name(
-            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-        )
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:
             tmp.write_text(encoded, encoding="utf-8")
             os.replace(tmp, path)
@@ -137,7 +137,6 @@ def _atomic_json(path: Path, payload: dict) -> bool:
             except OSError:
                 pass
             raise
-
     return False
 
 
@@ -182,11 +181,41 @@ def _schedule_label(candidate_name: str) -> str:
     return v7.action_label(candidate_name)
 
 
+def _signed_u8(value: int) -> int:
+    value = int(value) & 0xFF
+    return value - 256 if value >= 128 else value
+
+
+def _surrogate_record(observation, candidate) -> dict:
+    """Build the feature-only record shape used by TinySurrogateMLP."""
+    return {
+        "candidate": {
+            "name": str(candidate.name),
+            "horizon_frames": int(candidate.frame_count),
+            "schedule": _schedule_payload(candidate),
+        },
+        "start": {
+            "x": int(observation.mario_x_abs),
+            "y": int(observation.mario_y),
+            "y_high": int(observation.mario_y_high),
+            "vx": _signed_u8(observation.player_x_speed),
+            "vy": _signed_u8(observation.player_y_speed),
+            "player_state": int(observation.player_state),
+            "engine": int(observation.game_engine_subroutine),
+            "joypad": int(observation.raw_joypad),
+        },
+    }
+
+
 def shadow_worker_main(args: argparse.Namespace) -> int:
     assert args.request is not None and args.response is not None
     candidates = _candidate_shard(args.worker_index, args.worker_count)
     if not candidates:
         return 3
+
+    surrogate = None
+    if args.surrogate_model is not None:
+        surrogate = TinySurrogateMLP.load_json(args.surrogate_model)
 
     worker_home = Path(f"{args.shadow_home}-{args.worker_index}")
     core = MesenCore(args.dll)
@@ -215,34 +244,43 @@ def shadow_worker_main(args: argparse.Namespace) -> int:
         best = None
         best_outcome = None
         best_score = None
+        best_prediction = None
         started = time.perf_counter()
 
         try:
             for candidate in candidates:
                 base.restore_checkpoint(core, checkpoint, root_frame, root_x, root_engine)
                 start = observation_from_state(core.frame_count(), read_smb1_state(core))
+                prediction = surrogate.predict(_surrogate_record(start, candidate)) if surrogate else None
                 outcome = v10.run_candidate_pit_aware(core, candidate, start, args.step_timeout)
                 score = _score_outcome(outcome)
                 if best_score is None or score > best_score:
                     best_score = score
                     best = candidate
                     best_outcome = outcome
+                    best_prediction = prediction
 
             if best is not None and best_outcome is not None:
-                _atomic_json(
-                    args.response,
-                    {
-                        "generation": generation,
-                        "worker": args.worker_index,
-                        "root_frame": root_frame,
-                        "candidate": best.name,
-                        "schedule": _schedule_payload(best),
-                        "score": list(best_score),
-                        "progress": best_outcome.progress,
-                        "terminal": best_outcome.terminal.value,
-                        "compute_ms": round((time.perf_counter() - started) * 1000.0, 3),
-                    },
-                )
+                payload = {
+                    "generation": generation,
+                    "worker": args.worker_index,
+                    "root_frame": root_frame,
+                    "candidate": best.name,
+                    "schedule": _schedule_payload(best),
+                    "score": list(best_score),
+                    "progress": best_outcome.progress,
+                    "terminal": best_outcome.terminal.value,
+                    "compute_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                }
+                if best_prediction is not None:
+                    payload.update(
+                        {
+                            "surrogate_delta_x": float(best_prediction["delta_x"]),
+                            "risk_probability": float(best_prediction["risk_probability"]),
+                            "no_progress_probability": float(best_prediction["no_progress_probability"]),
+                        }
+                    )
+                _atomic_json(args.response, payload)
         except Exception as exc:
             _atomic_json(
                 args.response,
@@ -272,6 +310,8 @@ def _spawn_shadow_workers(args: argparse.Namespace, request_path: Path, response
             "--request", str(request_path),
             "--response", str(response_path),
         ]
+        if args.surrogate_model is not None:
+            cmd.extend(["--surrogate-model", str(args.surrogate_model)])
         workers.append(
             subprocess.Popen(
                 cmd,
@@ -396,11 +436,7 @@ def authority_main(args: argparse.Namespace) -> int:
     try:
         for loop_index in range(args.max_frames):
             schedule_age = max(0, current.native_frame_id - applied_plan_root)
-            applied_buttons = _schedule_buttons(
-                applied_schedule,
-                schedule_age,
-                repeat=using_bootstrap,
-            )
+            applied_buttons = _schedule_buttons(applied_schedule, schedule_age, repeat=using_bootstrap)
 
             base.set_nes_controller_state(core, 0, applied_buttons)
             base.step(core, args.step_timeout)
@@ -446,10 +482,16 @@ def authority_main(args: argparse.Namespace) -> int:
                     last_plan_root = applied_plan_root
                     last_plan_age = int(plan["age"])
                     last_plan_compute_ms = float(plan.get("compute_ms", 0.0))
+                    risk_text = ""
+                    if "risk_probability" in plan:
+                        risk_text = (
+                            f" risk={float(plan['risk_probability']):.3f}"
+                            f" stall={float(plan.get('no_progress_probability', 0.0)):.3f}"
+                        )
                     _log(
                         f"control update: {applied_label} root={last_plan_root} "
                         f"age={last_plan_age}f worker={plan.get('worker')} "
-                        f"compute={last_plan_compute_ms:.1f}ms"
+                        f"compute={last_plan_compute_ms:.1f}ms{risk_text}"
                     )
 
                 generation += 1
@@ -484,8 +526,6 @@ def authority_main(args: argparse.Namespace) -> int:
         _log(f"PlannerV11: FAIL frame limit | frame={current.native_frame_id} X={current.mario_x_abs}")
         return 7
     finally:
-        # Do not let teardown correctness hide the terminal result. The outer
-        # supervisor also owns a process-tree kill as the final Windows guard.
         for worker in workers:
             if worker.poll() is None:
                 worker.terminate()
