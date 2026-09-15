@@ -86,3 +86,18 @@ def test_ranking_metrics_count_actual_delta_x_ties_as_correct():
     assert report["top1_ranking_accuracy"] == 1.0
     assert report["top2_oracle_coverage"] == 1.0
     assert report["top3_oracle_coverage"] == 1.0
+
+
+def test_tiny_mlp_json_round_trip_preserves_predictions(tmp_path):
+    row = _row(3, "fast", 10, doomed=True)
+    model = TinySurrogateMLP(len(feature_vector(row)), hidden_size=5, seed=11)
+    before = model.predict(row)
+
+    path = tmp_path / "model.json"
+    model.save_json(path)
+    restored = TinySurrogateMLP.load_json(path)
+    after = restored.predict(row)
+
+    assert restored.input_size == model.input_size
+    assert restored.hidden_size == model.hidden_size
+    assert after == before
