@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--surrogate-risk-penalty", type=float, default=24.0)
     p.add_argument("--surrogate-no-progress-penalty", type=float, default=8.0)
     p.add_argument("--surrogate-dx-weight", type=float, default=0.25)
+    p.add_argument(
+        "--surrogate-risk-cutoff",
+        type=float,
+        default=0.20,
+        help="hard delayed-risk cutoff used by later guarded planners",
+    )
     p.add_argument("--authority-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--shadow-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--worker-index", type=int, default=0, help=argparse.SUPPRESS)
@@ -108,6 +114,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--plan-freshness must be >= 0")
     if args.shadow_workers <= 0:
         p.error("--shadow-workers must be > 0")
+    if not 0.0 <= args.surrogate_risk_cutoff <= 1.0:
+        p.error("--surrogate-risk-cutoff must be between 0 and 1")
     return args
 
 
@@ -436,7 +444,11 @@ def authority_main(args: argparse.Namespace) -> int:
     try:
         for loop_index in range(args.max_frames):
             schedule_age = max(0, current.native_frame_id - applied_plan_root)
-            applied_buttons = _schedule_buttons(applied_schedule, schedule_age, repeat=using_bootstrap)
+            applied_buttons = _schedule_buttons(
+                applied_schedule,
+                schedule_age,
+                repeat=using_bootstrap,
+            )
 
             base.set_nes_controller_state(core, 0, applied_buttons)
             base.step(core, args.step_timeout)
@@ -482,16 +494,18 @@ def authority_main(args: argparse.Namespace) -> int:
                     last_plan_root = applied_plan_root
                     last_plan_age = int(plan["age"])
                     last_plan_compute_ms = float(plan.get("compute_ms", 0.0))
-                    risk_text = ""
+                    surrogate_note = ""
                     if "risk_probability" in plan:
-                        risk_text = (
+                        surrogate_note = (
                             f" risk={float(plan['risk_probability']):.3f}"
                             f" stall={float(plan.get('no_progress_probability', 0.0)):.3f}"
                         )
+                    if "guard_mode" in plan:
+                        surrogate_note += f" guard={plan['guard_mode']}"
                     _log(
                         f"control update: {applied_label} root={last_plan_root} "
                         f"age={last_plan_age}f worker={plan.get('worker')} "
-                        f"compute={last_plan_compute_ms:.1f}ms{risk_text}"
+                        f"compute={last_plan_compute_ms:.1f}ms{surrogate_note}"
                     )
 
                 generation += 1
