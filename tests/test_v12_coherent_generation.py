@@ -1,12 +1,18 @@
 from pathlib import Path
 import importlib.util
+import sys
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "mesen_smb_checkpoint_planner_v12.py"
-spec = importlib.util.spec_from_file_location("planner_v12", MODULE_PATH)
-v12 = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(v12)
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+MODULE_PATH = EXAMPLES_DIR / "mesen_smb_checkpoint_planner_v12.py"
+sys.path.insert(0, str(EXAMPLES_DIR))
+try:
+    spec = importlib.util.spec_from_file_location("planner_v12", MODULE_PATH)
+    v12 = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(v12)
+finally:
+    sys.path.remove(str(EXAMPLES_DIR))
 
 
 def _write(path: Path, *, generation: int, worker: int, root: int, score, candidate: str):
