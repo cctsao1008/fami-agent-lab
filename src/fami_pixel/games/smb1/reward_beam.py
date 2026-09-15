@@ -52,6 +52,17 @@ REWARD_BEAM_CHUNKS: tuple[RewardBeamChunk, ...] = (
     ),
 )
 
+# The original six-chunk vocabulary can *start* a jump but cannot compose a
+# long button hold across control quanta: every rearm chunk releases A on its
+# first frame.  The star-visible-v24 replay showed that this matters in practice:
+# the active Star remained 20-50 px above Mario while V3/V4 repeatedly generated
+# short rearmed jumps.  Keep the old tuple stable for historical probe
+# reproducibility and expose an explicit extended vocabulary for V5+ searches.
+REWARD_BEAM_CHUNKS_WITH_HOLD: tuple[RewardBeamChunk, ...] = REWARD_BEAM_CHUNKS + (
+    RewardBeamChunk("hold_right_jump4", (ActionCommand(Smb1Action.RIGHT_A_B, 4),)),
+    RewardBeamChunk("hold_left_jump4", (ActionCommand(Smb1Action.LEFT_A_B, 4),)),
+)
+
 
 def buttons_for_chunk_frame(chunk: RewardBeamChunk, frame_offset: int) -> int:
     """Return the exact NES button byte for one frame inside a chunk."""
