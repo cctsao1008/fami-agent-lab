@@ -18,6 +18,13 @@ from .state import (
     Smb1State,
     read_smb1_state,
 )
+from .trajectory import (
+    TrajectoryEvent,
+    TrajectoryPlan,
+    TrajectoryResult,
+    evaluate_mesen_trajectory,
+    trajectory_outcome_key,
+)
 
 __all__ = [
     "ActionCommand",
@@ -35,11 +42,16 @@ __all__ = [
     "Smb1Observation",
     "TITLE_SCREEN_MODE",
     "Smb1State",
+    "TrajectoryEvent",
+    "TrajectoryPlan",
+    "TrajectoryResult",
     "action_to_nes_buttons",
     "derive_game_events",
+    "evaluate_mesen_trajectory",
     "observation_from_state",
     "read_smb1_observation",
     "read_smb1_state",
     "score_candidate",
     "select_best_candidate",
+    "trajectory_outcome_key",
 ]
