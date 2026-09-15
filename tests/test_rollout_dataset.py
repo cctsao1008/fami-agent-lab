@@ -56,12 +56,44 @@ def test_rollout_record_preserves_raw_state_and_signed_targets():
     assert record["target"]["delta_x"] == 30
     assert record["target"]["death"] is False
     assert record["target"]["no_progress"] is False
+    assert record["target"]["doomed_within_probe"] is False
+    assert "probe_terminal" not in record["target"]
 
 
-def test_rollout_summary_counts_hazards_and_terminals():
+def test_rollout_record_marks_delayed_death_from_authoritative_probe():
+    candidate = PlanCandidate("coast", (ActionCommand(Smb1Action.NOOP, 8),))
+    start = _observation(200, 400, 176, 18, 2)
+    end = _observation(208, 410, 182, 12, 4)
+    outcome = CandidateOutcome(
+        candidate=candidate,
+        start_x=400,
+        end_x=410,
+        max_x=412,
+        elapsed_frames=8,
+        terminal=CandidateTerminal.NONE,
+    )
+
+    record = build_rollout_record(
+        start,
+        end,
+        outcome,
+        source="probe-test",
+        generation=3,
+        probe_terminal="death",
+        probe_frames=48,
+    )
+
+    assert record["target"]["death"] is False
+    assert record["target"]["doomed_within_probe"] is True
+    assert record["target"]["probe_terminal"] == "death"
+    assert record["target"]["probe_frames"] == 48
+
+
+def test_rollout_summary_counts_hazards_terminals_and_probe_labels():
     candidate = PlanCandidate("right", (ActionCommand(Smb1Action.RIGHT, 8),))
     safe = CandidateOutcome(candidate, 10, 20, 20, 8)
-    dead = CandidateOutcome(candidate, 20, 20, 20, 8, CandidateTerminal.DEATH)
+    doomed = CandidateOutcome(candidate, 20, 25, 25, 8)
+    dead = CandidateOutcome(candidate, 25, 25, 25, 8, CandidateTerminal.DEATH)
 
     safe_record = build_rollout_record(
         _observation(1, 10, 176, 20, 0),
@@ -69,17 +101,27 @@ def test_rollout_summary_counts_hazards_and_terminals():
         safe,
         source="test",
     )
-    dead_record = build_rollout_record(
+    doomed_record = build_rollout_record(
         _observation(10, 20, 176, 20, 0),
-        _observation(18, 20, 200, 0, 4),
+        _observation(18, 25, 190, 8, 4),
+        doomed,
+        source="test",
+        probe_terminal="death",
+        probe_frames=48,
+    )
+    dead_record = build_rollout_record(
+        _observation(20, 25, 176, 20, 0),
+        _observation(28, 25, 200, 0, 4),
         dead,
         source="test",
     )
 
-    summary = summarize_rollout_records([safe_record, dead_record])
+    summary = summarize_rollout_records([safe_record, doomed_record, dead_record])
 
-    assert summary["records"] == 2
+    assert summary["records"] == 3
     assert summary["death_records"] == 1
+    assert summary["doomed_within_probe_records"] == 1
+    assert summary["probed_records"] == 1
     assert summary["no_progress_records"] == 1
-    assert summary["descending_low_records"] == 1
-    assert summary["candidate_counts"] == {"right": 2}
+    assert summary["descending_low_records"] == 2
+    assert summary["candidate_counts"] == {"right": 3}
