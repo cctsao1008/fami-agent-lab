@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from fami_pixel.adapters.mesen import NES_B, NES_LEFT, NES_RIGHT
+
 from .reward_beam import RewardBeamChunk
 
 
@@ -127,12 +129,12 @@ def reward_chunk_schedule(chunk: RewardBeamChunk) -> list[dict[str, int]]:
     ]
     name = chunk.name
     if "left" in name:
-        tail_buttons = 0x42  # LEFT | B
+        tail_buttons = NES_LEFT | NES_B
     elif "right" in name:
-        tail_buttons = 0x41  # RIGHT | B
+        tail_buttons = NES_RIGHT | NES_B
     else:
         tail_buttons = 0x00
-    schedule.append({"buttons": tail_buttons, "frames": 1})
+    schedule.append({"buttons": int(tail_buttons), "frames": 1})
     return schedule
 
 
