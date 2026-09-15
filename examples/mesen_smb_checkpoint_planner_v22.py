@@ -16,6 +16,11 @@ lifecycle boundary on Windows:
 - closing the supervisor's job handle kills any authority/shadow process that
   survives normal Python/native teardown.
 
+Issue #32 additionally needs deterministic historical roots after a live run.
+The V11 authority intentionally prunes old rolling checkpoints, so the V22
+supervisor now archives stable ``live-*.mss`` files into the runtime directory's
+``archive/`` subdirectory before they are pruned.
+
 This does not require administrator rights for the child processes created by
 the current user. Mesen, radar, reward, landing-zone, watchdog, and learned-risk
 semantics are unchanged.
@@ -28,6 +33,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from fami_pixel.runtime.checkpoint_archive import LiveCheckpointArchive
 from fami_pixel.runtime.process_lifecycle import (
     WindowsKillOnCloseJob,
     join_windows_job_from_env,
@@ -54,6 +60,14 @@ def authority_main(args) -> int:
             # V21/V20 cleanup remains the fallback and the failure is explicit.
             v11._log(f"Process job : join failed ({exc}); using fallback cleanup")
     return v20.authority_main(args)
+
+
+def _runtime_dir_from_line(line: str) -> Path | None:
+    marker = "Runtime IPC :"
+    if marker not in line:
+        return None
+    text = line.split(marker, 1)[1].strip()
+    return Path(text).expanduser().resolve() if text else None
 
 
 def supervise_main() -> int:
@@ -89,11 +103,21 @@ def supervise_main() -> int:
 
     shadow_pids: set[int] = set()
     result_code: int | None = None
+    checkpoint_archive: LiveCheckpointArchive | None = None
 
     try:
         for line in iter(proc.stdout.readline, ""):
             print(line, end="", flush=True)
             shadow_pids.update(v21._parse_shadow_pids(line))
+
+            if checkpoint_archive is None:
+                runtime_dir = _runtime_dir_from_line(line)
+                if runtime_dir is not None:
+                    checkpoint_archive = LiveCheckpointArchive(runtime_dir)
+                    checkpoint_archive.start()
+                    v11._log(
+                        f"Checkpoint archive: {checkpoint_archive.archive_dir} | preserving live roots"
+                    )
 
             payload = line[line.find("PlannerV11:"):] if "PlannerV11:" in line else line
             if payload.strip().startswith("PlannerV11: FAIL watchdog stall"):
@@ -131,6 +155,14 @@ def supervise_main() -> int:
         # fallback and as protection for an authority that failed to join the job.
         if proc.poll() is None:
             v11._terminate_process_tree(proc)
+
+        if checkpoint_archive is not None:
+            checkpoint_archive.stop()
+            v11._log(
+                "Checkpoint archive: complete | "
+                f"preserved={checkpoint_archive.archived_count}"
+            )
+
         v21._scrub_shadow_pids(shadow_pids)
 
 
