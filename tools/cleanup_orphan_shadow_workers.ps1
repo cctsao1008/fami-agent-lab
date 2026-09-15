@@ -1,38 +1,72 @@
 param(
-    [switch]$Kill
+    [switch]$Kill,
+    [switch]$AllPlannerProcesses
 )
 
-$pattern = 'mesen_smb_checkpoint_planner_v(11|12|13|14|15|16|17|18|19)\.py'
+$pattern = 'mesen_smb_checkpoint_planner_v(11|12|13|14|15|16|17|18|19|20|21)\.py'
 
-$workers = Get-CimInstance Win32_Process |
+$processes = Get-CimInstance Win32_Process |
     Where-Object {
         $_.Name -match '^python(w)?\.exe$' -and
-        $_.CommandLine -match $pattern -and
-        $_.CommandLine -match '--shadow-worker'
+        $_.CommandLine -match $pattern
     } |
     Sort-Object ProcessId
 
-if (-not $workers) {
-    Write-Host 'No fami-pixel shadow workers found.'
+if (-not $AllPlannerProcesses) {
+    $processes = $processes | Where-Object { $_.CommandLine -match '--shadow-worker' }
+}
+
+if (-not $processes) {
+    if ($AllPlannerProcesses) {
+        Write-Host 'No fami-pixel planner Python processes found.'
+    }
+    else {
+        Write-Host 'No fami-pixel shadow workers found.'
+    }
     exit 0
 }
 
-$workers | Select-Object ProcessId, ParentProcessId, Name, CommandLine | Format-Table -AutoSize
+$rows = foreach ($process in $processes) {
+    $role = if ($process.CommandLine -match '--shadow-worker') {
+        'shadow'
+    }
+    elseif ($process.CommandLine -match '--authority-worker') {
+        'authority'
+    }
+    else {
+        'supervisor'
+    }
+
+    [PSCustomObject]@{
+        ProcessId       = $process.ProcessId
+        ParentProcessId = $process.ParentProcessId
+        Role            = $role
+        CreationDate    = $process.CreationDate
+        CommandLine     = $process.CommandLine
+    }
+}
+
+$rows | Format-Table -AutoSize
 
 if (-not $Kill) {
     Write-Host ''
-    Write-Host 'Dry run only. Stop any active fami-pixel planner, then re-run with -Kill to remove these workers.'
+    if ($AllPlannerProcesses) {
+        Write-Host 'Dry run only. Stop any active fami-pixel planner, then re-run with -Kill -AllPlannerProcesses to remove all listed planner processes.'
+    }
+    else {
+        Write-Host 'Dry run only. Stop any active fami-pixel planner, then re-run with -Kill to remove these workers.'
+    }
     exit 0
 }
 
 Write-Host ''
-Write-Host "Stopping $($workers.Count) fami-pixel shadow worker(s)..."
-foreach ($worker in $workers) {
+Write-Host "Stopping $($processes.Count) fami-pixel planner process(es)..."
+foreach ($process in $processes) {
     try {
-        Stop-Process -Id $worker.ProcessId -Force -ErrorAction Stop
-        Write-Host "stopped PID $($worker.ProcessId)"
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        Write-Host "stopped PID $($process.ProcessId)"
     }
     catch {
-        Write-Warning "failed to stop PID $($worker.ProcessId): $($_.Exception.Message)"
+        Write-Warning "failed to stop PID $($process.ProcessId): $($_.Exception.Message)"
     }
 }
