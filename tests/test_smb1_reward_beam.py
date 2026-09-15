@@ -4,6 +4,7 @@ from fami_pixel.games.smb1.reward_beam import (
     matching_reward,
     reward_beam_key,
     reward_collection_proven,
+    reward_object_is_active,
 )
 
 
@@ -38,14 +39,35 @@ def test_star_collection_requires_timer_increase():
     )
 
 
-def test_reward_beam_prefers_visible_active_near_target_over_progress():
+def test_reward_object_active_state_uses_native_bit7_transition():
+    assert not reward_object_is_active({"state": 2})
+    assert not reward_object_is_active({"state": 17})
+    assert reward_object_is_active({"state": 0x80})
+    assert reward_object_is_active({"state": 0x81})
+
+
+def test_reward_beam_prefers_active_target_over_still_emerging_target():
+    active = reward_beam_key(
+        reward={"type": "star", "dx": -8, "state": 0x80},
+        nearest_enemy_dx=50,
+        mario_x=1600,
+    )
+    emerging = reward_beam_key(
+        reward={"type": "star", "dx": 0, "state": 17},
+        nearest_enemy_dx=100,
+        mario_x=1600,
+    )
+    assert active > emerging
+
+
+def test_reward_beam_prefers_near_target_over_progress_within_same_phase():
     near = reward_beam_key(
-        reward={"type": "star", "dx": -2, "state": 3},
+        reward={"type": "star", "dx": -2, "state": 0x80},
         nearest_enemy_dx=80,
         mario_x=1600,
     )
     far = reward_beam_key(
-        reward={"type": "star", "dx": 40, "state": 3},
+        reward={"type": "star", "dx": 40, "state": 0x80},
         nearest_enemy_dx=120,
         mario_x=1700,
     )
