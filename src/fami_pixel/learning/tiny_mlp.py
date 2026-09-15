@@ -1,22 +1,25 @@
 """Dependency-free one-hidden-layer baseline for SMB1 rollout surrogate learning.
 
-This module is deliberately an offline reference implementation. It does not
-participate in authoritative control. Mesen remains the transition/terminal
-oracle; this model only tests whether the current rollout feature contract is
-learnable before a compact C runtime (for example genann) is promoted.
+Mesen remains the transition/terminal oracle.  This module provides an
+inspectable Python reference model plus a small JSON persistence contract so a
+trained surrogate can be exercised by live planner experiments without adding
+an ANN runtime dependency yet.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 import math
+from pathlib import Path
 import random
 from statistics import mean
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 MAX_COMMANDS = 2
 DELTA_X_SCALE = 80.0
+MODEL_FORMAT = "fami-pixel-tiny-surrogate-v1"
 
 
 def _button_bits(value: int) -> list[float]:
@@ -93,6 +96,8 @@ class TinySurrogateMLP:
         self.b2 = [0.0, 0.0, 0.0]
 
     def _forward(self, x: list[float]) -> tuple[list[float], tuple[float, float, float]]:
+        if len(x) != self.input_size:
+            raise ValueError(f"expected {self.input_size} input features, got {len(x)}")
         hidden = []
         for row, bias in zip(self.w1, self.b1):
             activation = bias + sum(weight * value for weight, value in zip(row, x))
@@ -111,6 +116,53 @@ class TinySurrogateMLP:
             "no_progress_probability": output[2],
         }
 
+    def to_dict(self) -> dict:
+        return {
+            "format": MODEL_FORMAT,
+            "input_size": self.input_size,
+            "hidden_size": self.hidden_size,
+            "outputs": ["delta_x", "risk_probability", "no_progress_probability"],
+            "w1": self.w1,
+            "b1": self.b1,
+            "w2": self.w2,
+            "b2": self.b2,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "TinySurrogateMLP":
+        if payload.get("format") != MODEL_FORMAT:
+            raise ValueError(f"unsupported tiny surrogate format: {payload.get('format')!r}")
+        input_size = int(payload["input_size"])
+        hidden_size = int(payload["hidden_size"])
+        model = cls(input_size, hidden_size, seed=0)
+        w1 = [[float(value) for value in row] for row in payload["w1"]]
+        b1 = [float(value) for value in payload["b1"]]
+        w2 = [[float(value) for value in row] for row in payload["w2"]]
+        b2 = [float(value) for value in payload["b2"]]
+        if len(w1) != hidden_size or any(len(row) != input_size for row in w1):
+            raise ValueError("invalid first-layer shape in tiny surrogate artifact")
+        if len(b1) != hidden_size:
+            raise ValueError("invalid first-layer bias shape in tiny surrogate artifact")
+        if len(w2) != 3 or any(len(row) != hidden_size for row in w2):
+            raise ValueError("invalid output-layer shape in tiny surrogate artifact")
+        if len(b2) != 3:
+            raise ValueError("invalid output-layer bias shape in tiny surrogate artifact")
+        model.w1 = w1
+        model.b1 = b1
+        model.w2 = w2
+        model.b2 = b2
+        return model
+
+    def save_json(self, path: Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), separators=(",", ":")), encoding="utf-8")
+
+    @classmethod
+    def load_json(cls, path: Path) -> "TinySurrogateMLP":
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(payload)
+
     def fit(
         self,
         records: Iterable[dict],
@@ -118,6 +170,7 @@ class TinySurrogateMLP:
         epochs: int = 800,
         learning_rate: float = 0.01,
         seed: int = 22,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         rows = list(records)
         if not rows:
@@ -133,7 +186,8 @@ class TinySurrogateMLP:
 
         rng = random.Random(seed)
         order = list(range(len(rows)))
-        for _ in range(int(epochs)):
+        total_epochs = int(epochs)
+        for epoch_index in range(total_epochs):
             rng.shuffle(order)
             for row_index in order:
                 row = rows[row_index]
@@ -164,6 +218,9 @@ class TinySurrogateMLP:
                     for input_index in range(self.input_size):
                         self.w1[hidden_index][input_index] -= learning_rate * grad * x[input_index]
                     self.b1[hidden_index] -= learning_rate * grad
+
+            if progress_callback is not None:
+                progress_callback(epoch_index + 1, total_epochs)
 
 
 def _classification_metrics(labels: list[bool], probabilities: list[float]) -> dict[str, float | int | None]:
