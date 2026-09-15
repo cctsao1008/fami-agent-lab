@@ -1,7 +1,7 @@
 """Dependency-free one-hidden-layer baseline for SMB1 rollout surrogate learning.
 
-This module is deliberately an offline reference implementation.  It does not
-participate in authoritative control.  Mesen remains the transition/terminal
+This module is deliberately an offline reference implementation. It does not
+participate in authoritative control. Mesen remains the transition/terminal
 oracle; this model only tests whether the current rollout feature contract is
 learnable before a compact C runtime (for example genann) is promoted.
 """
@@ -53,11 +53,16 @@ def feature_vector(record: dict) -> list[float]:
     return features
 
 
+def _risk_label(record: dict) -> bool:
+    target = record["target"]
+    return bool(target.get("death")) or bool(target.get("doomed_within_probe"))
+
+
 def target_vector(record: dict) -> tuple[float, float, float]:
     target = record["target"]
     return (
         float(target["delta_x"]) / DELTA_X_SCALE,
-        1.0 if target.get("death") else 0.0,
+        1.0 if _risk_label(record) else 0.0,
         1.0 if target.get("no_progress") else 0.0,
     )
 
@@ -68,7 +73,7 @@ def _sigmoid(value: float) -> float:
 
 
 class TinySurrogateMLP:
-    """One tanh hidden layer with delta-X, death, and no-progress heads."""
+    """One tanh hidden layer with delta-X, combined-risk, and no-progress heads."""
 
     def __init__(self, input_size: int, hidden_size: int = 16, *, seed: int = 22):
         self.input_size = int(input_size)
@@ -102,7 +107,7 @@ class TinySurrogateMLP:
         _, output = self._forward(feature_vector(record))
         return {
             "delta_x": output[0] * DELTA_X_SCALE,
-            "death_probability": output[1],
+            "risk_probability": output[1],
             "no_progress_probability": output[2],
         }
 
@@ -118,9 +123,9 @@ class TinySurrogateMLP:
         if not rows:
             raise ValueError("cannot train TinySurrogateMLP on an empty dataset")
 
-        death_pos = sum(bool(row["target"].get("death")) for row in rows)
+        risk_pos = sum(_risk_label(row) for row in rows)
         no_progress_pos = sum(bool(row["target"].get("no_progress")) for row in rows)
-        death_weight = min(20.0, max(1.0, (len(rows) - death_pos) / max(1, death_pos)))
+        risk_weight = min(20.0, max(1.0, (len(rows) - risk_pos) / max(1, risk_pos)))
         no_progress_weight = min(
             20.0,
             max(1.0, (len(rows) - no_progress_pos) / max(1, no_progress_pos)),
@@ -133,13 +138,13 @@ class TinySurrogateMLP:
             for row_index in order:
                 row = rows[row_index]
                 x = feature_vector(row)
-                y_delta, y_death, y_no_progress = target_vector(row)
+                y_delta, y_risk, y_no_progress = target_vector(row)
                 hidden, output = self._forward(x)
-                p_delta, p_death, p_no_progress = output
+                p_delta, p_risk, p_no_progress = output
 
                 out_grad = [
                     p_delta - y_delta,
-                    0.5 * (death_weight if y_death else 1.0) * (p_death - y_death),
+                    0.5 * (risk_weight if y_risk else 1.0) * (p_risk - y_risk),
                     0.35
                     * (no_progress_weight if y_no_progress else 1.0)
                     * (p_no_progress - y_no_progress),
@@ -176,6 +181,36 @@ def _classification_metrics(labels: list[bool], probabilities: list[float]) -> d
     }
 
 
+def _ranking_metrics(
+    grouped: dict[tuple[str, int], list[tuple[dict, dict[str, float]]]]
+) -> dict[str, float | int | None]:
+    ranking_groups = 0
+    top1_correct = 0
+    top2_covered = 0
+    top3_covered = 0
+
+    for items in grouped.values():
+        if len(items) < 2:
+            continue
+        ranking_groups += 1
+        actual_max = max(float(item[0]["target"]["delta_x"]) for item in items)
+        predicted_order = sorted(items, key=lambda item: item[1]["delta_x"], reverse=True)
+
+        if float(predicted_order[0][0]["target"]["delta_x"]) == actual_max:
+            top1_correct += 1
+        if any(float(item[0]["target"]["delta_x"]) == actual_max for item in predicted_order[:2]):
+            top2_covered += 1
+        if any(float(item[0]["target"]["delta_x"]) == actual_max for item in predicted_order[:3]):
+            top3_covered += 1
+
+    return {
+        "ranking_groups": ranking_groups,
+        "top1_ranking_accuracy": top1_correct / ranking_groups if ranking_groups else None,
+        "top2_oracle_coverage": top2_covered / ranking_groups if ranking_groups else None,
+        "top3_oracle_coverage": top3_covered / ranking_groups if ranking_groups else None,
+    }
+
+
 def evaluate_model(model: TinySurrogateMLP, records: Iterable[dict]) -> dict:
     rows = list(records)
     predictions = [model.predict(row) for row in rows]
@@ -188,25 +223,13 @@ def evaluate_model(model: TinySurrogateMLP, records: Iterable[dict]) -> dict:
     for row, prediction in zip(rows, predictions):
         grouped[(str(row.get("source", "")), int(row["generation"]))].append((row, prediction))
 
-    ranking_groups = 0
-    ranking_correct = 0
-    for items in grouped.values():
-        if len(items) < 2:
-            continue
-        predicted_best = max(items, key=lambda item: item[1]["delta_x"])[0]
-        actual_best = max(items, key=lambda item: float(item[0]["target"]["delta_x"]))[0]
-        ranking_groups += 1
-        if predicted_best["candidate"]["name"] == actual_best["candidate"]["name"]:
-            ranking_correct += 1
-
     return {
         "records": len(rows),
         "delta_x_mae": mean(errors) if errors else None,
-        "ranking_groups": ranking_groups,
-        "top1_ranking_accuracy": ranking_correct / ranking_groups if ranking_groups else None,
-        "death": _classification_metrics(
-            [bool(row["target"].get("death")) for row in rows],
-            [prediction["death_probability"] for prediction in predictions],
+        **_ranking_metrics(grouped),
+        "risk": _classification_metrics(
+            [_risk_label(row) for row in rows],
+            [prediction["risk_probability"] for prediction in predictions],
         ),
         "no_progress": _classification_metrics(
             [bool(row["target"].get("no_progress")) for row in rows],
