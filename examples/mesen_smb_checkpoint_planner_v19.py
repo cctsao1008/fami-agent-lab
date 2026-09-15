@@ -14,6 +14,8 @@ reward channel without weakening the existing authority boundary:
   gaps/terrain remain hazards.
 - Web UI and timeline evidence record reward target, utility, pursuit state,
   capability state, and observable collection transitions.
+- Each authority run owns isolated IPC/checkpoint state, and shadow workers carry
+  a parent lease so they cannot become permanent orphan planners.
 
 Mesen remains authoritative for world state, collision, collection, death, level
 completion, and framebuffer evidence.
@@ -21,6 +23,7 @@ completion, and framebuffer evidence.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +34,12 @@ from fami_pixel.games.smb1.rewards import (
     best_reward_opportunity,
     select_reward_preferred_plan,
     should_pursue_reward,
+)
+from fami_pixel.runtime.process_lifecycle import (
+    authority_pid_from_env,
+    isolated_run_dir,
+    leased_worker_environment,
+    start_parent_lease_monitor,
 )
 from fami_pixel.telemetry import format_radar_strip
 
@@ -289,6 +298,39 @@ def _reward_publish_core(
     )
 
 
+def _spawn_leased_shadow_workers(args, request_path: Path, response_paths: list[Path]):
+    """Spawn V19 workers owned by this exact authority process."""
+    workers: list[subprocess.Popen] = []
+    env = leased_worker_environment(os.getpid())
+    for index, response_path in enumerate(response_paths):
+        cmd = [
+            sys.executable,
+            "-u",
+            str(Path(__file__).resolve()),
+            str(args.rom),
+            "--dll", str(args.dll),
+            "--shadow-home", str(args.shadow_home),
+            "--step-timeout", str(args.step_timeout),
+            "--shadow-worker",
+            "--worker-index", str(index),
+            "--worker-count", str(len(response_paths)),
+            "--request", str(request_path),
+            "--response", str(response_path),
+        ]
+        if args.surrogate_model is not None:
+            cmd.extend(["--surrogate-model", str(args.surrogate_model)])
+        workers.append(
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        )
+    v11._log("Shadow PIDs : " + ", ".join(str(worker.pid) for worker in workers))
+    return workers
+
+
 def _install_reward_overrides() -> None:
     global _watchdog_append_timeline, _watchdog_publish_core
 
@@ -300,6 +342,7 @@ def _install_reward_overrides() -> None:
     # preempts it exactly as before.
     v18._original_best_plan = best_coherent_reward_plan
     v15._radar_reason = _reward_aware_radar_reason
+    v15._spawn_shadow_workers = _spawn_leased_shadow_workers
     v17.read_smb1_radar = _tracking_read_smb1_radar
     v17.PLANNER_NAME = PLANNER_NAME
 
@@ -311,7 +354,15 @@ def _install_reward_overrides() -> None:
 
 
 def authority_main(args) -> int:
+    # V11-V18 historically reused one fixed request/response directory. A
+    # pre-V18 orphan worker could therefore wake up during a later run and race
+    # current workers. V19 gives every authority process an isolated IPC root.
+    runtime_dir = isolated_run_dir(args.checkpoint_dir)
+    args.checkpoint_dir = runtime_dir
+    args.shadow_home = args.shadow_home.expanduser().resolve() / runtime_dir.name
+
     _install_reward_overrides()
+    v11._log(f"Runtime IPC : {runtime_dir}")
     v11._log(
         "Planner V19: reward-aware native radar enabled | "
         "hazard-first + state-dependent power-up pursuit + V18 watchdog"
@@ -362,6 +413,8 @@ def supervise_main() -> int:
 def main() -> int:
     args = v11.parse_args()
     if args.shadow_worker:
+        parent_pid = authority_pid_from_env()
+        start_parent_lease_monitor(parent_pid)
         return v15.shadow_worker_main(args)
     if args.authority_worker:
         return authority_main(args)
