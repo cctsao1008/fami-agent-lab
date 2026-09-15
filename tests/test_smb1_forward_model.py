@@ -2,6 +2,7 @@ from fami_pixel.games.smb1.forward_model import (
     BASELINE_TRAJECTORY_PLANS,
     execution_prefix_schedule,
     result_is_safe_resolved,
+    select_safe_resolved_result,
     shard_trajectory_plans,
 )
 from fami_pixel.games.smb1.trajectory import TrajectoryEvent, TrajectoryResult
@@ -57,3 +58,20 @@ def test_horizon_is_not_safe_but_landing_is():
     assert not result_is_safe_resolved(_result(TrajectoryEvent.HORIZON))
     assert not result_is_safe_resolved(_result(TrajectoryEvent.DEATH))
     assert result_is_safe_resolved(_result(TrajectoryEvent.LANDED))
+
+
+def test_safe_selector_rejects_death_and_horizon_only_sets():
+    assert select_safe_resolved_result(
+        [_result(TrajectoryEvent.DEATH), _result(TrajectoryEvent.DEATH)]
+    ) is None
+    assert select_safe_resolved_result(
+        [_result(TrajectoryEvent.DEATH), _result(TrajectoryEvent.HORIZON)]
+    ) is None
+
+
+def test_safe_selector_prefers_resolved_safe_event_over_death():
+    landing = _result(TrajectoryEvent.LANDED)
+    selected = select_safe_resolved_result(
+        [_result(TrajectoryEvent.DEATH), landing, _result(TrajectoryEvent.HORIZON)]
+    )
+    assert selected is landing
