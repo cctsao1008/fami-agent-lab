@@ -109,13 +109,27 @@ def _restore(core: MesenCore, state_file: Path, manifest: dict) -> None:
     )
 
 
-def worker(args: argparse.Namespace) -> int:
-    scenario_dir = args.scenario_dir.expanduser().resolve()
+def _load_manifest(scenario_dir: Path) -> tuple[Path, dict, Path]:
     manifest_path = scenario_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not manifest_path.is_file():
+        raise SystemExit(
+            "scenario manifest not found: "
+            f"{manifest_path}\n"
+            "The scenario extractor must succeed before running the trajectory probe."
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid scenario manifest: {manifest_path}: {exc}") from exc
     state_file = scenario_dir / str(manifest.get("state_file", "root.mss"))
     if not state_file.is_file():
         raise SystemExit(f"scenario state not found: {state_file}")
+    return manifest_path, manifest, state_file
+
+
+def worker(args: argparse.Namespace) -> int:
+    scenario_dir = args.scenario_dir.expanduser().resolve()
+    _manifest_path, manifest, state_file = _load_manifest(scenario_dir)
 
     target_reward = args.target_reward or manifest.get("selection_reward_type")
     core = MesenCore(args.dll)
@@ -188,6 +202,10 @@ def _terminate_tree(proc: subprocess.Popen) -> None:
 
 
 def supervise(args: argparse.Namespace) -> int:
+    # Validate the local scenario before spawning the worker, so extraction
+    # failures produce one concise message instead of a child traceback.
+    _load_manifest(args.scenario_dir.expanduser().resolve())
+
     cmd = [sys.executable, "-u", str(Path(__file__).resolve()), *sys.argv[1:], "--worker"]
     proc = subprocess.Popen(
         cmd,
