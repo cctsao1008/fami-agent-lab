@@ -155,9 +155,26 @@ def worker(args: argparse.Namespace) -> int:
     core.initialize_debugger()
 
     print(f"Scenario   : {manifest.get('id')}", flush=True)
-    print(f"Root       : generation={manifest.get('root_generation')} frame={manifest.get('native_frame')} X={manifest.get('mario_x')}", flush=True)
+    print(
+        f"Root       : generation={manifest.get('root_generation')} "
+        f"frame={manifest.get('native_frame')} X={manifest.get('mario_x')} "
+        f"Y={manifest.get('mario_y')}",
+        flush=True,
+    )
     print(f"Target     : {target_reward or 'navigation'}", flush=True)
     print(f"Horizon    : {args.max_horizon} frames (hard cap; horizon event = UNRESOLVED)", flush=True)
+
+    try:
+        root_y = int(manifest.get("mario_y"))
+    except (TypeError, ValueError):
+        root_y = None
+    if target_reward is None and root_y is not None and root_y >= 224:
+        print(
+            "WARNING    : root Mario Y is already below the normal playfield; "
+            "this scenario may be post-commit / unrecoverable. Re-extract with "
+            "--stable-root or a larger --lead-generations value.",
+            flush=True,
+        )
 
     results = []
     try:
