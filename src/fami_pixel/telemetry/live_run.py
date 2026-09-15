@@ -74,6 +74,7 @@ class LiveRunArtifacts:
         self.path = root.expanduser().resolve() / f"{stamp}-{safe_planner}"
         self.path.mkdir(parents=True, exist_ok=False)
         self.timeline_path = self.path / "timeline.jsonl"
+        self.timeline_path.touch(exist_ok=False)
         self._timeline_count = 0
         self._finalized = False
 
