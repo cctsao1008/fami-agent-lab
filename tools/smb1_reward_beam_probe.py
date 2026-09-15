@@ -25,6 +25,7 @@ import time
 
 from fami_pixel.adapters.mesen import (
     MesenCore,
+    MesenLoadError,
     configure_standard_nes_controller,
     set_nes_controller_state,
 )
@@ -56,7 +57,7 @@ class BeamNode:
     frame: int
     mario_x: int
     mario_y: int
-    key: tuple[int, int, int, int, int]
+    key: tuple[int, ...]
     target_dx: int | None
     target_state: int | None
     nearest_enemy_dx: int | None
@@ -82,13 +83,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--home", type=Path, default=Path("build/mesen-home-reward-beam-probe"))
     p.add_argument("--depth", type=int, default=8, help="maximum 4-frame chunk depth (default: 8)")
     p.add_argument("--beam-width", type=int, default=16, help="alive states retained per depth (default: 16)")
-    p.add_argument("--step-timeout", type=float, default=2.0)
+    p.add_argument(
+        "--step-timeout",
+        type=float,
+        default=5.0,
+        help="native synchronous-frame timeout in seconds (default: 5.0)",
+    )
+    p.add_argument(
+        "--step-retries",
+        type=int,
+        default=1,
+        help="retries for native frame-step timeout status 4/5 before quarantining a branch (default: 1)",
+    )
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
     if args.depth <= 0:
         p.error("--depth must be > 0")
     if args.beam_width <= 0:
         p.error("--beam-width must be > 0")
+    if args.step_timeout <= 0:
+        p.error("--step-timeout must be > 0")
+    if args.step_retries < 0:
+        p.error("--step-retries must be >= 0")
     return args
 
 
@@ -124,6 +140,33 @@ def _restore(core: MesenCore, state_file: Path, *, expected_frame: int, expected
 
 def _radar(core: MesenCore, mario_x: int) -> dict:
     return read_smb1_radar(core, player_x=mario_x).to_payload()
+
+
+def _is_native_step_timeout(exc: BaseException) -> bool:
+    """Recognize only the synchronous step timeout statuses exposed by Mesen."""
+
+    text = str(exc)
+    return (
+        "FamiPixelStepFrame failed (4:" in text
+        or "FamiPixelStepFrame failed (5:" in text
+    )
+
+
+def _wait_for_debugger_stop(core: MesenCore, grace_s: float = 0.5) -> bool:
+    """Give a timed-out native step a short chance to reach its debugger stop."""
+
+    deadline = time.monotonic() + max(0.0, float(grace_s))
+    while time.monotonic() < deadline:
+        try:
+            if core.is_execution_stopped():
+                return True
+        except Exception:
+            return False
+        time.sleep(0.005)
+    try:
+        return bool(core.is_execution_stopped())
+    except Exception:
+        return False
 
 
 def _simulate_chunk(
@@ -270,7 +313,8 @@ def worker(args: argparse.Namespace) -> int:
     )
     print(
         f"Search     : depth={args.depth} chunks x 4f, beam={args.beam_width}, "
-        f"vocab={len(REWARD_BEAM_CHUNKS)}",
+        f"vocab={len(REWARD_BEAM_CHUNKS)} step_timeout={args.step_timeout:.1f}s "
+        f"step_retries={args.step_retries}",
         flush=True,
     )
     print("Objective  : authoritative collection > keep target visible/close > enemy clearance", flush=True)
@@ -279,31 +323,73 @@ def worker(args: argparse.Namespace) -> int:
     expansions = 0
     deaths = 0
     target_lost = 0
+    step_timeouts = 0
 
     try:
         for depth in range(1, args.depth + 1):
             children: list[BeamNode] = []
             depth_deaths = 0
             depth_lost = 0
+            depth_timeouts = 0
 
             for parent_index, parent in enumerate(beam):
                 for chunk_index, chunk in enumerate(REWARD_BEAM_CHUNKS):
                     expansions += 1
-                    _restore(
-                        core,
-                        parent.state_file,
-                        expected_frame=parent.frame,
-                        expected_x=parent.mario_x,
-                    )
-                    outcome = _simulate_chunk(
-                        core,
-                        chunk,
-                        target_reward=str(target_reward),
-                        baseline_player_status=baseline_status,
-                        baseline_star_timer=baseline_star_timer,
-                        step_timeout=float(args.step_timeout),
-                    )
                     path = parent.path + (chunk.name,)
+                    outcome: ChunkOutcome | None = None
+
+                    for attempt in range(int(args.step_retries) + 1):
+                        try:
+                            _restore(
+                                core,
+                                parent.state_file,
+                                expected_frame=parent.frame,
+                                expected_x=parent.mario_x,
+                            )
+                        except Exception as exc:
+                            if attempt == 0:
+                                raise
+                            print(
+                                f"STEP QUARANTINE: depth={depth} chunk={chunk.name} "
+                                f"path={_path_text(path)} | retry restore failed: {exc}",
+                                flush=True,
+                            )
+                            outcome = None
+                            break
+
+                        try:
+                            timeout_s = float(args.step_timeout) * (2.0 if attempt else 1.0)
+                            outcome = _simulate_chunk(
+                                core,
+                                chunk,
+                                target_reward=str(target_reward),
+                                baseline_player_status=baseline_status,
+                                baseline_star_timer=baseline_star_timer,
+                                step_timeout=timeout_s,
+                            )
+                            break
+                        except MesenLoadError as exc:
+                            if not _is_native_step_timeout(exc):
+                                raise
+                            depth_timeouts += 1
+                            step_timeouts += 1
+                            print(
+                                f"STEP TIMEOUT : depth={depth} chunk={chunk.name} "
+                                f"attempt={attempt + 1}/{int(args.step_retries) + 1} "
+                                f"timeout={timeout_s:.1f}s path={_path_text(path)}",
+                                flush=True,
+                            )
+                            try:
+                                set_nes_controller_state(core, 0, 0x00)
+                            except Exception:
+                                pass
+                            if attempt >= int(args.step_retries):
+                                outcome = None
+                                break
+                            _wait_for_debugger_stop(core, grace_s=min(1.0, float(args.step_timeout)))
+
+                    if outcome is None:
+                        continue
 
                     if outcome.collected:
                         timer = int(outcome.radar.get("star_invincible_timer", 0))
@@ -318,7 +404,11 @@ def worker(args: argparse.Namespace) -> int:
                             f"star_timer={baseline_star_timer}->{timer}",
                             flush=True,
                         )
-                        print(f"EXPANSIONS : {expansions} death={deaths + depth_deaths} target_lost={target_lost + depth_lost}", flush=True)
+                        print(
+                            f"EXPANSIONS : {expansions} death={deaths + depth_deaths} "
+                            f"target_lost={target_lost + depth_lost} step_timeouts={step_timeouts}",
+                            flush=True,
+                        )
                         print(_DONE, flush=True)
                         return 0
 
@@ -338,9 +428,17 @@ def worker(args: argparse.Namespace) -> int:
             target_lost += depth_lost
             if not children:
                 print(
-                    f"DEPTH {depth:02d}  : no alive children | deaths={depth_deaths}",
+                    f"DEPTH {depth:02d}  : no alive children | deaths={depth_deaths} "
+                    f"timeouts={depth_timeouts}",
                     flush=True,
                 )
+                if depth_timeouts:
+                    print(
+                        "NO RESULT  : all surviving candidates became unresolved because native frame stepping timed out",
+                        flush=True,
+                    )
+                    print(_DONE, flush=True)
+                    return 3
                 print("NO COLLECT : beam exhausted before authoritative collection", flush=True)
                 print(_DONE, flush=True)
                 return 2
@@ -358,7 +456,8 @@ def worker(args: argparse.Namespace) -> int:
             visible_count = sum(node.target_dx is not None for node in keep)
             print(
                 f"DEPTH {depth:02d}  : alive={len(children):3d} keep={len(keep):2d} "
-                f"visible={visible_count:2d} deaths={depth_deaths:2d} lost={depth_lost:2d} | "
+                f"visible={visible_count:2d} deaths={depth_deaths:2d} lost={depth_lost:2d} "
+                f"timeouts={depth_timeouts:2d} | "
                 f"best dx={best.target_dx} state={best.target_state} enemy={best.nearest_enemy_dx} "
                 f"X={best.mario_x} Y={best.mario_y} path={_path_text(best.path)}",
                 flush=True,
@@ -384,7 +483,11 @@ def worker(args: argparse.Namespace) -> int:
             f"X={best.mario_x} path={_path_text(best.path)}",
             flush=True,
         )
-        print(f"EXPANSIONS : {expansions} death={deaths} target_lost={target_lost}", flush=True)
+        print(
+            f"EXPANSIONS : {expansions} death={deaths} target_lost={target_lost} "
+            f"step_timeouts={step_timeouts}",
+            flush=True,
+        )
         print(_DONE, flush=True)
         return 1
     finally:
