@@ -47,6 +47,10 @@ The environment is designed to support three observation modes:
 
 This makes it possible to compare pure visual control against privileged emulator-state control without modifying the game ROM.
 
+## Design notes
+
+- [Reward-aware SMB1 planning](docs/architecture/reward-aware-planning.md) — separate hazard avoidance from state-dependent power-up pursuit while keeping Mesen authoritative.
+
 ## Design rule
 
 Keep the emulator as the source of truth for machine state, keep Python as the experimentation layer, and keep game-specific semantics isolated from the generic NES environment.
